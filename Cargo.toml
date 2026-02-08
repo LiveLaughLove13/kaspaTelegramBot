@@ -1,0 +1,50 @@
+[package]
+name = "kaspa-telegram-bot"
+version = "0.1.0"
+edition = "2021"
+description = "Telegram notifications for confirmed Kaspa transactions and blocks"
+authors = ["LiveLoveLaugh"]
+
+[dependencies]
+# Kaspa dependencies - using git versions from master branch
+kaspa-consensus-core = { git = "https://github.com/kaspanet/rusty-kaspa.git", branch = "master" }
+kaspa-hashes = { git = "https://github.com/kaspanet/rusty-kaspa.git", branch = "master" }
+kaspa-addresses = { git = "https://github.com/kaspanet/rusty-kaspa.git", branch = "master" }
+kaspa-rpc-core = { git = "https://github.com/kaspanet/rusty-kaspa.git", branch = "master" }
+kaspa-grpc-client = { git = "https://github.com/kaspanet/rusty-kaspa.git", branch = "master" }
+kaspa-notify = { git = "https://github.com/kaspanet/rusty-kaspa.git", branch = "master" }
+kaspa-utils = { git = "https://github.com/kaspanet/rusty-kaspa.git", branch = "master" }
+
+# Async runtime
+tokio = { version = "1.0", features = ["full"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+
+# HTTP client for Telegram API
+reqwest = { version = "0.11", features = ["json"] }
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Time handling
+chrono = { version = "0.4", features = ["serde"] }
+
+# Utilities
+hex = "0.4"
+once_cell = "1.19"
+parking_lot = "0.12"
+
+# wasm-bindgen version will be resolved from rusty-kaspa workspace dependencies
+
+[[bin]]
+name = "kaspa-telegram-bot"
+path = "src/main.rs"
+
