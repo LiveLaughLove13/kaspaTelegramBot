@@ -4,15 +4,17 @@ A standalone Telegram bot for receiving notifications about confirmed Kaspa tran
 
 ## Features
 
-- ✅ **Confirmed Events Only**: Only sends notifications after transactions/blocks are fully confirmed in the DAG
-- ✅ **Configurable Confirmation Depth**: Set the minimum DAA score difference required for confirmation
+- ✅ **Blue Block Verification**: Only sends notifications for blocks confirmed blue in the DAG (matching bridge semantics)
+- ✅ **Robust Verification**: Two-step process with tip hash check and consecutive blue confirmations (30 retries, 2-second delays)
 - ✅ **Incoming Transactions**: Get notified when you receive KAS
 - ✅ **Outgoing Transactions**: Get notified when you send KAS (including fees)
 - ✅ **Solo Mining Block Rewards**: Get notified when you mine a block
 - ✅ **Per-Notification Toggle**: Enable/disable each notification type separately
 - ✅ **Balance Tracking**: Shows previous balance → new balance for transactions
+- ✅ **Real-Time Balances**: Refreshes every 5 minutes for accuracy
 - ✅ **Interactive Commands**: Add/remove tracked addresses via Telegram messages
 - ✅ **Address Management**: List all tracked addresses and their balances
+- ✅ **Rewards History**: View chronological block rewards history
 
 ## Requirements
 
@@ -93,6 +95,9 @@ Once the bot is running, you can interact with it via Telegram:
 - **`/add <address>`** - Add a Kaspa address to track
 - **`/remove <address>`** - Remove a tracked address
 - **`/list`** - List all tracked addresses with their balances
+- **`/balance`** - Show current balance for tracked addresses
+- **`/refresh`** - Manually refresh balances from blockchain
+- **`/rewards`** - View block rewards history (chronological order)
 
 **Quick Add:** Just send a Kaspa address directly (e.g., `kaspa:qpxxxxxx...`) and the bot will automatically start tracking it!
 
@@ -134,22 +139,18 @@ The bot will automatically create `bot-config.toml` with default settings if it 
 1. **Connects to Kaspa Node**: The bot connects to your Kaspa node via gRPC
 2. **Subscribes to Notifications**: Subscribes to `BlockAdded` and `UtxosChanged` notifications
 3. **Tracks Wallet Addresses**: Monitors specified wallet addresses for activity
-4. **Checks Confirmation**: When a transaction/block is detected, it checks if it's confirmed by comparing DAA scores
+4. **Verifies Blue Blocks**: Uses two-step verification (tip hash check + blue status confirmation)
 5. **Sends Notifications**: Only sends Telegram notifications for confirmed events
 
-### Confirmation Logic
+### Blue Block Verification
 
-A transaction or block is considered **confirmed** when:
-```
-virtual_daa_score - transaction_daa_score >= daa_score_depth
-```
+The bot uses the same verification logic as the rusty-kaspa bridge:
 
-Where:
-- `virtual_daa_score`: Current virtual DAA score from the node
-- `transaction_daa_score`: DAA score when the transaction/block was included
-- `daa_score_depth`: Configurable confirmation depth (default: 10)
+1. **Tip Hash Check**: Verifies block has propagated to DAG's tip hashes (10 attempts, 2-second delays)
+2. **Blue Status Check**: Verifies block is blue confirmed (30 attempts, 2-second delays, 5 consecutive confirms)
+3. **Only Blue Blocks**: Blocks that don't pass verification are rejected (not reported)
 
-This ensures notifications are only sent for transactions/blocks that are deeply embedded in the DAG, reducing the risk of false positives from reorgs.
+This ensures notifications are only sent for blocks that are actually accepted into the DAG.
 
 ## Notification Formats
 
@@ -184,6 +185,8 @@ Timestamp: 2026-02-07 12:34:56 UTC
 
 Address: kaspa:xxxx
 Reward: +X.XX KAS
+🔴 Previous balance: Y.YY KAS
+🟢 New balance: Z.ZZ KAS
 Block Hash: abc123...
 Block DAA Score: 12345
 Timestamp: 2026-02-07 12:34:56 UTC
