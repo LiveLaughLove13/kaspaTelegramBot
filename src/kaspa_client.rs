@@ -23,6 +23,9 @@ pub struct KaspaClient {
     user_addresses: Arc<parking_lot::Mutex<HashMap<i64, HashSet<String>>>>,
     // Maps address to user chat_id for quick lookup
     address_to_user: Arc<parking_lot::Mutex<HashMap<String, i64>>>,
+    // Cache of recent transactions from blocks (txid -> transaction data)
+    // This allows us to look up transaction details even after they're confirmed
+    recent_transactions: Arc<tokio::sync::Mutex<HashMap<String, kaspa_rpc_core::RpcTransaction>>>,
 }
 
 impl KaspaClient {
@@ -145,6 +148,7 @@ impl KaspaClient {
             notification_rx: Arc::new(Mutex::new(Some(rx))),
             user_addresses: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             address_to_user: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            recent_transactions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         })
     }
 
@@ -445,6 +449,111 @@ impl KaspaClient {
         sompi as f64 / KAS_TO_SOMPI
     }
 
+    // Store transaction from block for later lookup
+    pub async fn store_transaction_from_block(&self, tx: &kaspa_rpc_core::RpcTransaction) {
+        if let Some(verbose_data) = &tx.verbose_data {
+            let txid = verbose_data.transaction_id.to_string();
+            let mut cache = self.recent_transactions.lock().await;
+            // Keep only recent transactions (limit cache size to prevent memory issues)
+            if cache.len() > 10000 {
+                // Remove oldest 20% of entries
+                let to_remove: Vec<String> = cache.keys().take(2000).cloned().collect();
+                for key in to_remove {
+                    cache.remove(&key);
+                }
+            }
+            cache.insert(txid, tx.clone());
+        }
+    }
+
+    // Get transaction amounts from mempool or block cache
+    // Returns: (sent_amount, received_amount) where:
+    // - sent_amount: sum of outputs NOT to the tracked address (for outgoing transactions)
+    // - received_amount: sum of outputs TO the tracked address (for incoming transactions)
+    pub async fn get_transaction_sent_amount(
+        &self,
+        txid: &str,
+        tracked_address: &str,
+    ) -> Result<Option<(u64, u64)>> {
+        // First, try to get from mempool (with retry for recently confirmed transactions)
+        let mut attempt = 0;
+        let max_attempts = 3;
+        let mut backoff_ms = 100;
+        
+        loop {
+            attempt += 1;
+            match self.get_mempool_entry(txid).await {
+                Ok(Some(mempool_entry)) => {
+                    // Transaction found in mempool - calculate from outputs
+                    return self.calculate_sent_amount_from_tx(&mempool_entry.transaction, tracked_address);
+                }
+                Ok(None) if attempt < max_attempts => {
+                    // Transaction not in mempool - might be very recently confirmed, retry once
+                    debug!(
+                        "Transaction {} not in mempool (attempt {}/{}), retrying in {}ms (may be very recently confirmed)",
+                        txid, attempt, max_attempts, backoff_ms
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                    backoff_ms = (backoff_ms * 2).min(500);
+                    continue;
+                }
+                Ok(None) => {
+                    // Transaction not in mempool - try block cache
+                    break;
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to get mempool entry for {}: {}",
+                        txid, e
+                    );
+                    // Try block cache as fallback
+                    break;
+                }
+            }
+        }
+        
+        // Try to get from block cache
+        let cache = self.recent_transactions.lock().await;
+        if let Some(tx) = cache.get(txid) {
+            info!("Found transaction {} in block cache", txid);
+            return self.calculate_sent_amount_from_tx(tx, tracked_address);
+        }
+        
+        Ok(None)
+    }
+    
+    // Calculate amounts from transaction outputs
+    // Returns: (sent_amount, received_amount) where:
+    // - sent_amount: sum of outputs NOT to the tracked address
+    // - received_amount: sum of outputs TO the tracked address
+    fn calculate_sent_amount_from_tx(
+        &self,
+        tx: &kaspa_rpc_core::RpcTransaction,
+        tracked_address: &str,
+    ) -> Result<Option<(u64, u64)>> {
+        let mut sent_amount: u64 = 0;
+        let mut received_amount: u64 = 0;
+        
+        for output in &tx.outputs {
+            if let Some(verbose_data) = &output.verbose_data {
+                let output_address = verbose_data.script_public_key_address.to_string();
+                if output_address == tracked_address {
+                    // This is an output TO the tracked address (received/change)
+                    received_amount += output.value;
+                } else {
+                    // This is an output to another address (the actual amount sent)
+                    sent_amount += output.value;
+                }
+            }
+        }
+        
+        if sent_amount > 0 || received_amount > 0 {
+            Ok(Some((sent_amount, received_amount)))
+        } else {
+            Ok(None)
+        }
+    }
+
     // Check if a block is in the DAG's tip hashes
     // This is used to ensure blocks have propagated before checking blue status
     pub async fn is_block_in_tip_hashes(&self, block_hash: &str) -> Result<bool> {
@@ -466,4 +575,5 @@ impl KaspaClient {
             }
         }
     }
+
 }

@@ -1,7 +1,9 @@
 mod block_processor;
 mod command_handler;
 mod config;
+mod incoming_transaction;
 mod kaspa_client;
+mod outgoing_transaction;
 mod processor;
 mod telegram;
 mod transaction_processor;
@@ -142,7 +144,7 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Start periodic balance refresh (every hour)
+    // Start periodic balance refresh
     let processor_refresh = processor.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(300)); // 5 minutes

@@ -1,5 +1,7 @@
 use crate::config::Config;
+use crate::incoming_transaction::IncomingTransactionHandler;
 use crate::kaspa_client::KaspaClient;
+use crate::outgoing_transaction::OutgoingTransactionHandler;
 use crate::telegram::TelegramClient;
 use anyhow::{Context, Result};
 // Subnetwork IDs:
@@ -9,9 +11,9 @@ use kaspa_consensus_core::subnets::SUBNETWORK_ID_COINBASE;
 use kaspa_rpc_core::UtxosChangedNotification;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tokio::sync::Mutex;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 pub struct PendingTransaction {
     pub txid: String,
@@ -25,12 +27,16 @@ pub struct PendingTransaction {
 
 pub struct TransactionProcessor {
     kaspa_client: Arc<KaspaClient>,
+    #[allow(dead_code)]
     telegram_client: Arc<TelegramClient>,
     config: Arc<Config>,
     pending_transactions: Arc<Mutex<HashMap<String, PendingTransaction>>>,
+    #[allow(dead_code)]
     address_balances: Arc<Mutex<HashMap<String, u64>>>,
     notified_transactions: Arc<Mutex<HashSet<String>>>,
     notified_transactions_times: Arc<Mutex<HashMap<String, Instant>>>,
+    incoming_handler: IncomingTransactionHandler,
+    outgoing_handler: OutgoingTransactionHandler,
 }
 
 impl TransactionProcessor {
@@ -43,6 +49,26 @@ impl TransactionProcessor {
         notified_transactions: Arc<Mutex<HashSet<String>>>,
         notified_transactions_times: Arc<Mutex<HashMap<String, Instant>>>,
     ) -> Self {
+        let incoming_handler = IncomingTransactionHandler::new(
+            kaspa_client.clone(),
+            telegram_client.clone(),
+            config.clone(),
+            pending_transactions.clone(),
+            address_balances.clone(),
+            notified_transactions.clone(),
+            notified_transactions_times.clone(),
+        );
+
+        let outgoing_handler = OutgoingTransactionHandler::new(
+            kaspa_client.clone(),
+            telegram_client.clone(),
+            config.clone(),
+            pending_transactions.clone(),
+            address_balances.clone(),
+            notified_transactions.clone(),
+            notified_transactions_times.clone(),
+        );
+
         Self {
             kaspa_client,
             telegram_client,
@@ -51,9 +77,12 @@ impl TransactionProcessor {
             address_balances,
             notified_transactions,
             notified_transactions_times,
+            incoming_handler,
+            outgoing_handler,
         }
     }
 
+    #[allow(clippy::ifs_same_cond)]
     pub async fn handle_utxos_changed(
         &self,
         utxos_changed: UtxosChangedNotification,
@@ -206,18 +235,25 @@ impl TransactionProcessor {
         );
         for (address, (chat_id, removed_amount, added_amount, tx_daa_score, txid)) in address_data {
             info!(
-                "Processing transaction for address {}: removed={}, added={}, txid={}, daa_score={}",
-                address, removed_amount, added_amount, txid, tx_daa_score
+                "Processing transaction for address {}: removed={} sompi ({} KAS), added={} sompi ({} KAS), txid={}, daa_score={}, chat_id={}",
+                address, 
+                removed_amount, 
+                KaspaClient::sompi_to_kas(removed_amount),
+                added_amount,
+                KaspaClient::sompi_to_kas(added_amount),
+                txid, 
+                tx_daa_score,
+                chat_id
             );
 
             // Check if this transaction is already marked as notified (e.g., coinbase transactions
-            // are marked when we process block rewards)
+            // are marked when we process block rewards, or we already processed it from a previous UtxosChanged notification)
             {
                 let notified = self.notified_transactions.lock().await;
                 if notified.contains(&txid) {
-                    debug!(
-                        "Skipping transaction {} - already processed (likely a block reward)",
-                        txid
+                    info!(
+                        "Skipping transaction {} for address {} - already processed and notified (txid was processed in a previous UtxosChanged notification)",
+                        txid, address
                     );
                     continue;
                 }
@@ -278,15 +314,16 @@ impl TransactionProcessor {
                     txid, address, removed_amount, added_amount
                 );
                 if self.config.notifications.incoming_tx {
-                    self.handle_incoming_tx(
-                        &address,
-                        chat_id,
-                        txid.clone(),
-                        added_amount,
-                        tx_daa_score,
-                        virtual_daa_score,
-                    )
-                    .await?;
+                    self.incoming_handler
+                        .handle_incoming_tx(
+                            &address,
+                            chat_id,
+                            txid.clone(),
+                            added_amount,
+                            tx_daa_score,
+                            virtual_daa_score,
+                        )
+                        .await?;
                 } else {
                     debug!(
                         "Skipping incoming transaction {}: notifications disabled",
@@ -302,16 +339,17 @@ impl TransactionProcessor {
                     txid, address, removed_amount, added_amount
                 );
                 if self.config.notifications.outgoing_tx {
-                    self.handle_outgoing_tx(
-                        &address,
-                        chat_id,
-                        txid.clone(),
-                        removed_amount, // Sent amount (no change, so this is the full amount)
-                        removed_amount, // Net change (same as sent since no change)
-                        tx_daa_score,
-                        virtual_daa_score,
-                    )
-                    .await?;
+                    self.outgoing_handler
+                        .handle_outgoing_tx(
+                            &address,
+                            chat_id,
+                            txid.clone(),
+                            removed_amount, // Sent amount (no change, so this is the full amount)
+                            removed_amount, // Net change (same as sent since no change)
+                            tx_daa_score,
+                            virtual_daa_score,
+                        )
+                        .await?;
                 }
             } else if added_amount > removed_amount {
                 // Net incoming transaction (received more than spent)
@@ -321,15 +359,16 @@ impl TransactionProcessor {
                     txid, address, removed_amount, added_amount, net_incoming
                 );
                 if self.config.notifications.incoming_tx && net_incoming > 0 {
-                    self.handle_incoming_tx(
-                        &address,
-                        chat_id,
-                        txid.clone(),
-                        net_incoming,
-                        tx_daa_score,
-                        virtual_daa_score,
-                    )
-                    .await?;
+                    self.incoming_handler
+                        .handle_incoming_tx(
+                            &address,
+                            chat_id,
+                            txid.clone(),
+                            net_incoming,
+                            tx_daa_score,
+                            virtual_daa_score,
+                        )
+                        .await?;
                 } else {
                     debug!(
                         "Skipping incoming transaction {}: notifications disabled or net_incoming is 0",
@@ -345,6 +384,12 @@ impl TransactionProcessor {
                     "OUTGOING TX {} for {}: removed={} sompi, added={} sompi, net_outgoing={} sompi",
                     txid, address, removed_amount, added_amount, net_outgoing
                 );
+                
+                // Log notification settings for debugging
+                info!(
+                    "Outgoing notification settings: enabled={}, net_outgoing={}",
+                    self.config.notifications.outgoing_tx, net_outgoing
+                );
 
                 // Try to get transaction from mempool NOW to calculate actual sent amount from outputs
                 // This is critical because once the transaction is confirmed, we can't get it from mempool
@@ -356,13 +401,13 @@ impl TransactionProcessor {
                     // Outputs TO the tracked address are change and should be excluded
                     let tx = &mempool_entry.transaction;
                     let mut total_sent: u64 = 0;
-                    let mut outputs_to_tracked: u64 = 0;
+                    let mut received_to_tracked: u64 = 0;
                     for output in &tx.outputs {
                         if let Some(verbose_data) = &output.verbose_data {
                             let output_address = verbose_data.script_public_key_address.to_string();
                             if output_address == address {
-                                // This is change going back to the tracked address
-                                outputs_to_tracked += output.value;
+                                // This is an output TO the tracked address (change or received)
+                                received_to_tracked += output.value;
                             } else {
                                 // This is an output to another address (the actual amount sent)
                                 total_sent += output.value;
@@ -371,22 +416,26 @@ impl TransactionProcessor {
                     }
                     if total_sent > 0 {
                         info!(
-                            "Transaction {}: Calculated from outputs - sent to others: {} sompi, change to tracked address: {} sompi, UTXO net: {} sompi",
-                            txid, total_sent, outputs_to_tracked, net_outgoing
+                            "Transaction {}: Calculated from outputs - sent to others: {} sompi, received to tracked address: {} sompi, UTXO net: {} sompi",
+                            txid, total_sent, received_to_tracked, net_outgoing
                         );
                         Some(total_sent)
                     } else {
                         warn!(
                             "Transaction {}: No outputs to other addresses found (only {} sompi to tracked address). This shouldn't happen for outgoing transactions.",
-                            txid, outputs_to_tracked
+                            txid, received_to_tracked
                         );
                         None
                     }
                 } else {
-                    // Transaction not in mempool (already confirmed) - will use UTXO calculation as fallback
-                    warn!(
-                        "Transaction {} not in mempool (already confirmed). Cannot calculate sent amount from outputs. Using UTXO net: {} sompi",
-                        txid, net_outgoing
+                    // Transaction not in mempool (already confirmed) - cannot get transaction outputs from node
+                    // For regular outgoing transactions (removed > added), UTXO net calculation is accurate
+                    // This represents the actual net amount that left the address (sent + fee - change)
+                    info!(
+                        "Transaction {} not in mempool (already confirmed). Using UTXO net calculation: {} sompi ({} KAS) as sent amount.",
+                        txid,
+                        net_outgoing,
+                        KaspaClient::sompi_to_kas(net_outgoing)
                     );
                     None
                 };
@@ -394,490 +443,329 @@ impl TransactionProcessor {
                     // Use actual sent amount from outputs if available, otherwise use UTXO net
                     // IMPORTANT: We pass both the sent amount (for display) and net change (for balance)
                     let sent_amount_for_display = actual_sent_amount.unwrap_or(net_outgoing);
-                    self.handle_outgoing_tx(
-                        &address,
-                        chat_id,
-                        txid.clone(),
-                        sent_amount_for_display, // Amount to display (actual sent to recipients)
-                        net_outgoing, // Net change for balance calculation (removed - added)
-                        tx_daa_score,
-                        virtual_daa_score,
-                    )
-                    .await?;
+                    info!(
+                        "Calling handle_outgoing_tx for txid {}: sent_amount={} sompi ({} KAS), net_change={} sompi ({} KAS), chat_id={}",
+                        txid, 
+                        sent_amount_for_display, 
+                        KaspaClient::sompi_to_kas(sent_amount_for_display),
+                        net_outgoing,
+                        KaspaClient::sompi_to_kas(net_outgoing),
+                        chat_id
+                    );
+                    // Validate net_change makes sense
+                    if net_outgoing == 0 && sent_amount_for_display > 0 {
+                        warn!(
+                            "WARNING: net_change is 0 but sent_amount is {} for transaction {} - this might be a self-transfer that should be skipped",
+                            sent_amount_for_display, txid
+                        );
+                    }
+                    // IMPORTANT: Don't mark as notified here - let the handler do it AFTER successfully sending
+                    // This ensures that if notification fails, we can retry
+                    self.outgoing_handler
+                        .handle_outgoing_tx(
+                            &address,
+                            chat_id,
+                            txid.clone(),
+                            sent_amount_for_display, // Amount to display (actual sent to recipients)
+                            net_outgoing, // Net change for balance calculation (removed - added)
+                            tx_daa_score,
+                            virtual_daa_score,
+                        )
+                        .await?;
                 } else {
-                    debug!(
-                        "Skipping outgoing transaction {}: notifications disabled or net_outgoing is 0",
-                        txid
+                    warn!(
+                        "Skipping outgoing transaction {}: notifications enabled={}, net_outgoing={} sompi ({} KAS)",
+                        txid, 
+                        self.config.notifications.outgoing_tx, 
+                        net_outgoing,
+                        KaspaClient::sompi_to_kas(net_outgoing)
                     );
                 }
             } else if removed_amount > 0 && added_amount > 0 && removed_amount == added_amount {
-                // removed_amount == added_amount: This could be a self-transfer
-                // Still notify about it, but as an outgoing transaction (since it spent UTXOs)
-                // The net is 0, but we should still show the activity
+                // removed_amount == added_amount: Need to check transaction outputs to determine direction
+                // This could be:
+                // 1. Incoming transaction where sender also sent change back to themselves (rare but possible)
+                // 2. Outgoing transaction where change equals what was sent (self-transfer)
+                // 3. Mixed transaction
+                
+                // Get transaction details to determine if it's incoming or outgoing
+                match self.kaspa_client.get_transaction_sent_amount(&txid, &address).await {
+                    Ok(Some((sent_to_others, received_to_tracked))) => {
+                        // We have transaction details - determine direction based on outputs
+                        if received_to_tracked > sent_to_others {
+                            // More received than sent - this is an incoming transaction
+                            let net_incoming = received_to_tracked.saturating_sub(sent_to_others);
+                            info!(
+                                "Transaction {} (removed==added): Determined as INCOMING from outputs - received: {} sompi ({} KAS), sent: {} sompi ({} KAS), net_incoming: {} sompi ({} KAS)",
+                                txid,
+                                received_to_tracked,
+                                KaspaClient::sompi_to_kas(received_to_tracked),
+                                sent_to_others,
+                                KaspaClient::sompi_to_kas(sent_to_others),
+                                net_incoming,
+                                KaspaClient::sompi_to_kas(net_incoming)
+                            );
+                            if self.config.notifications.incoming_tx && net_incoming > 0 {
+                                self.incoming_handler
+                                    .handle_incoming_tx(
+                                        &address,
+                                        chat_id,
+                                        txid.clone(),
+                                        received_to_tracked, // Use actual received amount
+                                        tx_daa_score,
+                                        virtual_daa_score,
+                                    )
+                                    .await?;
+                            }
+                            continue; // Skip to next address
+                        } else if sent_to_others > 0 {
+                            // Has outputs to other addresses - this is an outgoing transaction
+                            info!(
+                                "Transaction {} (removed==added): Determined as OUTGOING from outputs - sent: {} sompi ({} KAS), received (change): {} sompi ({} KAS)",
+                                txid,
+                                sent_to_others,
+                                KaspaClient::sompi_to_kas(sent_to_others),
+                                received_to_tracked,
+                                KaspaClient::sompi_to_kas(received_to_tracked)
+                            );
+                            if self.config.notifications.outgoing_tx {
+                                let net_outgoing = removed_amount.saturating_sub(added_amount); // Should be 0, but use fee
+                                let net_change = if net_outgoing == 0 { 100_000 } else { net_outgoing }; // Fee estimate
+                                self.outgoing_handler
+                                    .handle_outgoing_tx(
+                                        &address,
+                                        chat_id,
+                                        txid.clone(),
+                                        sent_to_others, // Actual sent amount
+                                        net_change,
+                                        tx_daa_score,
+                                        virtual_daa_score,
+                                    )
+                                    .await?;
+                            }
+                            continue; // Skip to next address
+                        } else {
+                            // No outputs to others, all to tracked address - true self-transfer
+                            info!(
+                                "Transaction {} (removed==added): True self-transfer - all outputs to tracked address ({} sompi). Skipping.",
+                                txid, received_to_tracked
+                            );
+                            let mut notified = self.notified_transactions.lock().await;
+                            notified.insert(txid.clone());
+                            drop(notified);
+                            let mut times = self.notified_transactions_times.lock().await;
+                            times.insert(txid, Instant::now());
+                            continue;
+                        }
+                    }
+                    Ok(None) => {
+                        // Cannot get transaction details - skip to avoid incorrect classification
+                        warn!(
+                            "Transaction {} (removed==added): Cannot get transaction details. Cannot determine if incoming or outgoing. Skipping to avoid incorrect classification.",
+                            txid
+                        );
+                        let mut notified = self.notified_transactions.lock().await;
+                        notified.insert(txid.clone());
+                        drop(notified);
+                        let mut times = self.notified_transactions_times.lock().await;
+                        times.insert(txid, Instant::now());
+                        continue;
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Transaction {} (removed==added): Failed to get transaction details: {}. Cannot determine if incoming or outgoing. Skipping.",
+                            txid, e
+                        );
+                        let mut notified = self.notified_transactions.lock().await;
+                        notified.insert(txid.clone());
+                        drop(notified);
+                        let mut times = self.notified_transactions_times.lock().await;
+                        times.insert(txid, Instant::now());
+                        continue;
+                    }
+                }
+            } else if removed_amount == 0 && added_amount > 0 {
+                // This case should have been handled above, but adding as safety check
+                // Pure incoming transaction (no inputs from this address, only outputs to it)
+                info!(
+                    "Processing PURE INCOMING transaction {} for address {}: removed={}, added={}",
+                    txid, address, removed_amount, added_amount
+                );
+                if self.config.notifications.incoming_tx {
+                    self.incoming_handler
+                        .handle_incoming_tx(
+                            &address,
+                            chat_id,
+                            txid.clone(),
+                            added_amount,
+                            tx_daa_score,
+                            virtual_daa_score,
+                        )
+                        .await?;
+                }
+                continue; // IMPORTANT: Skip to next address to avoid processing as outgoing
+            } else if removed_amount > 0 && added_amount == 0 {
+                // Pure outgoing with no change
+                // For pure outgoing, removed_amount is both the sent amount and net change (no change returned)
                 debug!(
-                    "Processing self-transfer transaction {} for address {}: removed={}, added={} (net=0, showing as outgoing)",
+                    "Processing pure outgoing transaction {} for address {}: removed={}, added={}",
                     txid, address, removed_amount, added_amount
                 );
                 if self.config.notifications.outgoing_tx {
-                    // Show as outgoing with 0 net (or show the amount spent)
-                    // For self-transfers, net_change is 0 (removed == added)
-                    let net_change = 0u64;
-                    self.handle_outgoing_tx(
-                        &address,
-                        chat_id,
-                        txid.clone(),
-                        removed_amount, // Show the amount that was moved
-                        net_change,     // Net change is 0 for self-transfers
-                        tx_daa_score,
-                        virtual_daa_score,
-                    )
-                    .await?;
+                    self.outgoing_handler
+                        .handle_outgoing_tx(
+                            &address,
+                            chat_id,
+                            txid.clone(),
+                            removed_amount, // Sent amount (no change, so this is the full amount)
+                            removed_amount, // Net change (same as sent since no change)
+                            tx_daa_score,
+                            virtual_daa_score,
+                        )
+                        .await?;
                 }
-            } else {
-                // Both are 0 or some other edge case - log and skip
-                debug!(
-                    "Skipping transaction {} for address {}: removed={}, added={} (no activity)",
-                    txid, address, removed_amount, added_amount
+            } else if added_amount > removed_amount {
+                // Net incoming transaction (received more than spent)
+                let net_incoming = added_amount - removed_amount;
+                info!(
+                    "Processing INCOMING transaction {} for address {}: removed={}, added={}, net={}",
+                    txid, address, removed_amount, added_amount, net_incoming
                 );
-                // Mark as notified to prevent future processing
-                let mut notified = self.notified_transactions.lock().await;
-                notified.insert(txid.clone());
-                drop(notified);
-                let mut times = self.notified_transactions_times.lock().await;
-                times.insert(txid, Instant::now());
-            }
-        }
-
-        Ok(())
-    }
-
-    async fn handle_incoming_tx(
-        &self,
-        address: &str,
-        chat_id: i64,
-        txid: String,
-        amount: u64,
-        tx_daa_score: u64,
-        virtual_daa_score: u64,
-    ) -> Result<()> {
-        // Check if we've already notified about this transaction (early exit to avoid duplicate work)
-        {
-            let notified = self.notified_transactions.lock().await;
-            if notified.contains(&txid) {
-                debug!("Transaction {} already notified, skipping duplicate", txid);
-                return Ok(());
-            }
-        }
-
-        // Cleanup old notified transactions periodically (keep last 7 days worth, ~10,000 entries)
-        // Only cleanup every 100th transaction to avoid performance impact
-        {
-            let notified = self.notified_transactions.lock().await;
-            if notified.len() % 100 == 0 {
-                drop(notified);
-                self.cleanup_old_notified_transactions().await;
-            }
-        }
-
-        // Check if transaction is already in a block (not in mempool)
-        // If it's not in mempool, it's already confirmed and we can process it immediately
-        let mempool_entry_opt = self
-            .kaspa_client
-            .get_mempool_entry(&txid)
-            .await
-            .ok()
-            .flatten();
-        let is_in_block = mempool_entry_opt.is_none();
-
-        let confirmation_depth = self.config.confirmation.daa_score_depth;
-        let daa_diff = virtual_daa_score.saturating_sub(tx_daa_score);
-
-        // If transaction is already in a block (confirmed), process immediately
-        // Otherwise, wait for DAA depth confirmation
-        if !is_in_block && daa_diff < confirmation_depth {
-            // Not yet confirmed, store as pending
-            debug!(
-                "Transaction {} not yet confirmed (DAA diff: {} < {}, in_mempool: true)",
-                txid, daa_diff, confirmation_depth
-            );
-            let mut pending = self.pending_transactions.lock().await;
-            // Only add to pending if not already there (avoid duplicate pending entries)
-            if !pending.contains_key(&txid) {
-                pending.insert(
-                    txid.clone(),
-                    PendingTransaction {
-                        txid: txid.clone(),
-                        address: address.to_string(),
-                        chat_id,
-                        amount: amount as i64,
-                        net_change: None, // Not used for incoming transactions
-                        daa_score: tx_daa_score,
-                        is_incoming: true,
-                    },
-                );
-            }
-            return Ok(());
-        }
-
-        // Transaction is confirmed and not yet notified
-        info!(
-            "Incoming transaction confirmed: {} (DAA diff: {}, in_block: {})",
-            txid, daa_diff, is_in_block
-        );
-
-        // Mark as notified BEFORE sending to prevent race conditions
-        // Use atomic check-and-insert to prevent concurrent processing
-        {
-            let mut notified = self.notified_transactions.lock().await;
-            // Double-check after acquiring lock (another thread might have inserted it)
-            if notified.contains(&txid) {
-                debug!(
-                    "Transaction {} already notified by another thread, skipping",
-                    txid
-                );
-                return Ok(());
-            }
-            notified.insert(txid.clone());
-        }
-        {
-            let mut times = self.notified_transactions_times.lock().await;
-            times.insert(txid.clone(), Instant::now());
-        }
-
-        // Get transaction timestamp from mempool entry or use current time
-        let timestamp = match mempool_entry_opt {
-            Some(entry) => entry
-                .transaction
-                .verbose_data
-                .map(|vd| vd.block_time)
-                .unwrap_or_else(|| chrono::Utc::now().timestamp_millis() as u64),
-            None => {
-                // Transaction not in mempool (already confirmed), use current time
-                chrono::Utc::now().timestamp_millis() as u64
-            }
-        };
-
-        // Update balance - fetch from blockchain if not in map
-        let previous_balance = {
-            let balances = self.address_balances.lock().await;
-            if let Some(&cached) = balances.get(address) {
-                cached
-            } else {
-                // Balance not in map, release lock and fetch from blockchain
-                // For incoming transactions, current_balance = previous_balance + amount
-                // So previous_balance = current_balance - amount
-                drop(balances);
-                match self.kaspa_client.get_balance(address).await {
-                    Ok(current_balance) => {
-                        let prev = current_balance.saturating_sub(amount);
-                        info!("Fetched balance for {} from blockchain: {} sompi (current), calculated previous: {} sompi", address, current_balance, prev);
-                        prev
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Failed to fetch balance for {} from blockchain: {}, using 0",
-                            address, e
-                        );
-                        0
-                    }
+                if self.config.notifications.incoming_tx && net_incoming > 0 {
+                    self.incoming_handler
+                        .handle_incoming_tx(
+                            &address,
+                            chat_id,
+                            txid.clone(),
+                            net_incoming,
+                            tx_daa_score,
+                            virtual_daa_score,
+                        )
+                        .await?;
+                } else {
+                    debug!(
+                        "Skipping incoming transaction {}: notifications disabled or net_incoming is 0",
+                        txid
+                    );
                 }
-            }
-        };
-        let new_balance = previous_balance + amount;
-        let mut balances = self.address_balances.lock().await;
-        balances.insert(address.to_string(), new_balance);
+                continue; // IMPORTANT: Skip to next address to avoid processing as outgoing
+            } else if removed_amount > added_amount {
+                // Net outgoing transaction (spent more than received back as change)
+                let net_outgoing = removed_amount - added_amount;
 
-        // Send notification to the specific user
-        self.telegram_client
-            .send_incoming_tx_to_chat(
-                chat_id,
-                address,
-                KaspaClient::sompi_to_kas(amount),
-                KaspaClient::sompi_to_kas(previous_balance),
-                KaspaClient::sompi_to_kas(new_balance),
-                &txid,
-                tx_daa_score,
-                timestamp,
-            )
-            .await
-            .unwrap_or_else(|e| {
-                error!(
-                    "Failed to send Telegram notification to chat {}: {}",
-                    chat_id, e
-                )
-            });
-
-        // Remove from pending
-        self.pending_transactions.lock().await.remove(&txid);
-
-        Ok(())
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn handle_outgoing_tx(
-        &self,
-        address: &str,
-        chat_id: i64,
-        txid: String,
-        sent_amount: u64, // Amount sent to recipients (for display)
-        net_change: u64,  // Net change for balance (removed - added = sent + fee - change)
-        tx_daa_score: u64,
-        virtual_daa_score: u64,
-    ) -> Result<()> {
-        // Check if we've already notified about this transaction (early exit to avoid duplicate work)
-        {
-            let notified = self.notified_transactions.lock().await;
-            if notified.contains(&txid) {
-                debug!("Transaction {} already notified, skipping duplicate", txid);
-                return Ok(());
-            }
-        }
-
-        // Cleanup old notified transactions periodically (keep last 7 days worth, ~10,000 entries)
-        // Only cleanup every 100th transaction to avoid performance impact
-        {
-            let notified = self.notified_transactions.lock().await;
-            if notified.len() % 100 == 0 {
-                drop(notified);
-                self.cleanup_old_notified_transactions().await;
-            }
-        }
-
-        // Check if transaction is already in a block (not in mempool)
-        // If it's not in mempool, it's already confirmed and we can process it immediately
-        let mempool_entry_opt = self
-            .kaspa_client
-            .get_mempool_entry(&txid)
-            .await
-            .ok()
-            .flatten();
-        let is_in_block = mempool_entry_opt.is_none();
-
-        let confirmation_depth = self.config.confirmation.daa_score_depth;
-        let daa_diff = virtual_daa_score.saturating_sub(tx_daa_score);
-
-        // If transaction is already in a block (confirmed), process immediately
-        // Otherwise, wait for DAA depth confirmation
-        if !is_in_block && daa_diff < confirmation_depth {
-            // Not yet confirmed, store as pending
-            debug!(
-                "Transaction {} not yet confirmed (DAA diff: {} < {}, in_mempool: true)",
-                txid, daa_diff, confirmation_depth
-            );
-            let mut pending = self.pending_transactions.lock().await;
-            // Only add to pending if not already there (avoid duplicate pending entries)
-            if !pending.contains_key(&txid) {
-                pending.insert(
-                    txid.clone(),
-                    PendingTransaction {
-                        txid: txid.clone(),
-                        address: address.to_string(),
-                        chat_id,
-                        amount: -(sent_amount as i64), // Store sent amount for display
-                        net_change: Some(net_change),  // Store net change for balance calculation
-                        daa_score: tx_daa_score,
-                        is_incoming: false,
-                    },
+                info!(
+                    "OUTGOING TX {} for {}: removed={} sompi, added={} sompi, net_outgoing={} sompi",
+                    txid, address, removed_amount, added_amount, net_outgoing
                 );
-            }
-            return Ok(());
-        }
-
-        // Transaction is confirmed and not yet notified
-        info!(
-            "Outgoing transaction confirmed: {} (DAA diff: {}, in_block: {})",
-            txid, daa_diff, is_in_block
-        );
-
-        // Mark as notified BEFORE sending to prevent race conditions
-        // Use atomic check-and-insert to prevent concurrent processing
-        {
-            let mut notified = self.notified_transactions.lock().await;
-            // Double-check after acquiring lock (another thread might have inserted it)
-            if notified.contains(&txid) {
-                debug!(
-                    "Transaction {} already notified by another thread, skipping",
-                    txid
-                );
-                return Ok(());
-            }
-            notified.insert(txid.clone());
-        }
-        {
-            let mut times = self.notified_transactions_times.lock().await;
-            times.insert(txid.clone(), Instant::now());
-        }
-
-        // Get transaction details for fee and timestamp
-        // NOTE: The amount parameter should already be the actual sent amount (calculated from outputs)
-        // if the transaction was in mempool when we processed UtxosChanged. If not, it's the UTXO net.
-        let (fee, timestamp) = match mempool_entry_opt {
-            Some(entry) => {
-                let tx = &entry.transaction;
-
-                // Calculate fee from transaction data
-                let fee = self
-                    .kaspa_client
-                    .calculate_transaction_fee(tx)
-                    .await
-                    .unwrap_or_else(|| {
-                        // If fee calculation fails, estimate as 0.001 KAS (100,000 sompi) as typical minimum
-                        warn!(
-                            "Could not calculate fee for transaction {}, using default estimate",
-                            txid
-                        );
-                        100_000 // 0.001 KAS default estimate
-                    });
-
-                // Get timestamp - block_time is in milliseconds
-                let ts = tx
-                    .verbose_data
-                    .as_ref()
-                    .map(|vd| vd.block_time)
-                    .unwrap_or_else(|| chrono::Utc::now().timestamp_millis() as u64);
-
-                (fee, ts)
-            }
-            None => {
-                // Transaction not in mempool (already confirmed)
-                // CRITICAL ISSUE: When transaction is confirmed, we can't get it from mempool
-                // The UTXO calculation (removed - added) should give us the net amount sent
-                // But if it's showing the change amount instead, there's a bug in the UTXO calculation
-                //
-                // The UTXO calculation should be:
-                // - removed_amount = total inputs spent from tracked address
-                // - added_amount = change returned to tracked address
-                // - net_outgoing = removed_amount - added_amount = amount sent + fee
-                //
-                // If we're seeing the change amount (155 KAS) instead of sent amount (12 KAS),
-                // it means the UTXO calculation is wrong or we're using added_amount instead of net
-                //
-                // TODO: Add method to get transaction from block to calculate from outputs
-                // For now, we have to use the UTXO calculation which may be incorrect
-                warn!(
-                    "Transaction {} not found in mempool (already confirmed). \
-                    Using sent_amount: {} sompi, net_change: {} sompi. \
-                    WARNING: If transaction was already confirmed when first processed, amounts may be incorrect.",
-                    txid, sent_amount, net_change
-                );
-                (100_000, chrono::Utc::now().timestamp_millis() as u64) // 0.001 KAS default
-            }
-        };
-
-        // Update balance - use incremental update based on UTXO changes (like wallet code does)
-        // CRITICAL: net_change = removed_amount - added_amount = (amount_sent + fee) - change_returned
-        // This is the actual amount that left the address
-        //
-        // IMPORTANT: We update balance incrementally from UTXO changes, not by fetching from blockchain
-        // This matches how the wallet code works and is more reliable
-        let previous_balance = {
-            let balances = self.address_balances.lock().await;
-            if let Some(&cached) = balances.get(address) {
-                cached
-            } else {
-                // Balance not in cache, release lock and fetch from blockchain
-                drop(balances);
-                match self.kaspa_client.get_balance(address).await {
-                    Ok(current_balance) => {
-                        // Current balance is AFTER the transaction
-                        // Previous balance = current + net_change
-                        let prev = current_balance.saturating_add(net_change);
+                
+                if self.config.notifications.outgoing_tx {
+                    // Calculate sent amount from transaction outputs if available
+                    // IMPORTANT: Sum outputs NOT to the tracked address (these are the actual sent amounts)
+                    // Outputs TO the tracked address are change and should be excluded
+                    let actual_sent_amount = if let Ok(Some(mempool_entry)) =
+                        self.kaspa_client.get_mempool_entry(&txid).await
+                    {
+                        // Transaction is in mempool - calculate actual sent amount from outputs
+                        // IMPORTANT: Sum outputs NOT to the tracked address (these are the actual sent amounts)
+                        // Outputs TO the tracked address are change and should be excluded
+                        let tx = &mempool_entry.transaction;
+                        let mut total_sent: u64 = 0;
+                        let mut received_to_tracked: u64 = 0;
+                        for output in &tx.outputs {
+                            if let Some(verbose_data) = &output.verbose_data {
+                                let output_address = verbose_data.script_public_key_address.to_string();
+                                if output_address == address {
+                                    // This is an output TO the tracked address (change or received)
+                                    received_to_tracked += output.value;
+                                } else {
+                                    // This is an output to another address (the actual amount sent)
+                                    total_sent += output.value;
+                                }
+                            }
+                        }
+                        if total_sent > 0 {
+                            info!(
+                                "Transaction {}: Calculated from outputs - sent to others: {} sompi, received to tracked address: {} sompi, UTXO net: {} sompi",
+                                txid, total_sent, received_to_tracked, net_outgoing
+                            );
+                            Some(total_sent)
+                        } else {
+                            warn!(
+                                "Transaction {}: No outputs to other addresses found (only {} sompi to tracked address). This shouldn't happen for outgoing transactions.",
+                                txid, received_to_tracked
+                            );
+                            None
+                        }
+                    } else {
+                        // Transaction not in mempool (already confirmed) - cannot get transaction outputs from node
+                        // For regular outgoing transactions (removed > added), UTXO net calculation is accurate
+                        // This represents the actual net amount that left the address (sent + fee - change)
                         info!(
-                            "Fetched balance for {} from blockchain: current (after tx) = {} sompi, calculated previous = {} sompi, net_change = {} sompi",
-                            address, current_balance, prev, net_change
+                            "Transaction {} not in mempool (already confirmed). Using UTXO net calculation: {} sompi ({} KAS) as sent amount.",
+                            txid,
+                            net_outgoing,
+                            KaspaClient::sompi_to_kas(net_outgoing)
                         );
-                        prev
-                    }
-                    Err(e) => {
+                        None
+                    };
+                    if net_outgoing > 0 {
+                    // Use actual sent amount from outputs if available, otherwise use UTXO net
+                    // IMPORTANT: We pass both the sent amount (for display) and net change (for balance)
+                    let sent_amount_for_display = actual_sent_amount.unwrap_or(net_outgoing);
+                    info!(
+                        "Calling handle_outgoing_tx for txid {}: sent_amount={} sompi ({} KAS), net_change={} sompi ({} KAS), chat_id={}",
+                        txid, 
+                        sent_amount_for_display, 
+                        KaspaClient::sompi_to_kas(sent_amount_for_display),
+                        net_outgoing,
+                        KaspaClient::sompi_to_kas(net_outgoing),
+                        chat_id
+                    );
+                    // Validate net_change makes sense
+                    if net_outgoing == 0 && sent_amount_for_display > 0 {
                         warn!(
-                            "Failed to fetch balance for {} from blockchain: {}, using 0",
-                            address, e
+                            "WARNING: net_change is 0 but sent_amount is {} for transaction {} - this might be a self-transfer that should be skipped",
+                            sent_amount_for_display, txid
                         );
-                        0
                     }
+                    // IMPORTANT: Don't mark as notified here - let the handler do it AFTER successfully sending
+                    // This ensures that if notification fails, we can retry
+                    self.outgoing_handler
+                        .handle_outgoing_tx(
+                            &address,
+                            chat_id,
+                            txid.clone(),
+                            sent_amount_for_display, // Amount to display (actual sent to recipients)
+                            net_outgoing, // Net change for balance calculation (removed - added)
+                            tx_daa_score,
+                            virtual_daa_score,
+                        )
+                        .await?;
+                } else {
+                    warn!(
+                        "Skipping outgoing transaction {}: notifications enabled={}, net_outgoing={} sompi ({} KAS)",
+                        txid, 
+                        self.config.notifications.outgoing_tx, 
+                        net_outgoing,
+                        KaspaClient::sompi_to_kas(net_outgoing)
+                    );
+                    }
+                } else {
+                    warn!(
+                        "Skipping outgoing transaction {}: notifications disabled or net_outgoing=0",
+                        txid
+                    );
                 }
+            } else {
+                // removed_amount == 0 && added_amount == 0 - shouldn't happen, but skip if it does
+                warn!(
+                    "Transaction {} for address {} has both removed=0 and added=0 - skipping",
+                    txid, address
+                );
             }
-        };
-
-        // Calculate new balance: previous - net_change
-        // net_change already includes the fee (it's removed - added, which accounts for everything)
-        let new_balance = previous_balance.saturating_sub(net_change);
-
-        // Update cached balance
-        {
-            let mut balances = self.address_balances.lock().await;
-            balances.insert(address.to_string(), new_balance);
         }
-
-        info!(
-            "Balance update for {}: previous = {} sompi, net_change = {} sompi, new = {} sompi",
-            address, previous_balance, net_change, new_balance
-        );
-
-        // Send notification to the specific user
-        // sent_amount is the amount sent to recipients (calculated from outputs, for display)
-        // net_change is used for balance calculation (removed - added)
-        self.telegram_client
-            .send_outgoing_tx_to_chat(
-                chat_id,
-                address,
-                KaspaClient::sompi_to_kas(sent_amount),
-                KaspaClient::sompi_to_kas(fee),
-                KaspaClient::sompi_to_kas(previous_balance),
-                KaspaClient::sompi_to_kas(new_balance),
-                &txid,
-                tx_daa_score,
-                timestamp,
-            )
-            .await
-            .unwrap_or_else(|e| {
-                error!(
-                    "Failed to send Telegram notification to chat {}: {}",
-                    chat_id, e
-                )
-            });
-
-        // Remove from pending
-        self.pending_transactions.lock().await.remove(&txid);
 
         Ok(())
-    }
-
-    // Cleanup old notified transactions to prevent memory growth
-    // Removes entries older than 7 days or if set exceeds 10,000 entries
-    async fn cleanup_old_notified_transactions(&self) {
-        const MAX_AGE_DAYS: u64 = 7;
-        const MAX_ENTRIES: usize = 10_000;
-        let max_age = Duration::from_secs(MAX_AGE_DAYS * 24 * 60 * 60);
-        let now = Instant::now();
-
-        let mut notified = self.notified_transactions.lock().await;
-        let mut times = self.notified_transactions_times.lock().await;
-
-        // If we're under the limit, only remove entries older than max_age
-        if notified.len() < MAX_ENTRIES {
-            let mut to_remove = Vec::new();
-            for (txid, &time) in times.iter() {
-                if now.duration_since(time) > max_age {
-                    to_remove.push(txid.clone());
-                }
-            }
-            for txid in to_remove {
-                notified.remove(&txid);
-                times.remove(&txid);
-            }
-        } else {
-            // Over limit: remove oldest entries until under limit
-            let mut entries: Vec<(String, Instant)> =
-                times.iter().map(|(k, v)| (k.clone(), *v)).collect();
-            entries.sort_by_key(|(_, time)| *time);
-
-            let to_remove_count = entries.len().saturating_sub(MAX_ENTRIES);
-            for (txid, _) in entries.iter().take(to_remove_count) {
-                notified.remove(txid);
-                times.remove(txid);
-            }
-        }
     }
 
     pub async fn check_pending_confirmations(&self, virtual_daa_score: u64) -> Result<()> {
@@ -901,6 +789,10 @@ impl TransactionProcessor {
 
             // Process if: (1) transaction is in a block, OR (2) DAA depth is met
             if is_in_block || daa_diff >= confirmation_depth {
+                info!(
+                    "Pending transaction {} is now confirmed (is_in_block: {}, daa_diff: {}, confirmation_depth: {})",
+                    txid, is_in_block, daa_diff, confirmation_depth
+                );
                 confirmed_txs.push(txid.clone());
             }
         }
@@ -924,31 +816,46 @@ impl TransactionProcessor {
             let pending = self.pending_transactions.lock().await.remove(&txid);
             if let Some(pending) = pending {
                 if pending.is_incoming {
-                    self.handle_incoming_tx(
-                        &pending.address,
-                        pending.chat_id,
-                        pending.txid.clone(),
-                        pending.amount as u64,
-                        pending.daa_score,
-                        virtual_daa_score,
-                    )
-                    .await?;
+                    info!(
+                        "Processing pending incoming transaction {} from queue",
+                        pending.txid
+                    );
+                    self.incoming_handler
+                        .handle_incoming_tx(
+                            &pending.address,
+                            pending.chat_id,
+                            pending.txid.clone(),
+                            pending.amount as u64,
+                            pending.daa_score,
+                            virtual_daa_score,
+                        )
+                        .await?;
                 } else {
                     // For pending outgoing transactions, use stored net_change if available
                     // Otherwise use the stored amount (fallback for old pending transactions)
                     let sent_amount = (-pending.amount) as u64;
                     let net_change_for_balance = pending.net_change.unwrap_or(sent_amount);
-                    self.handle_outgoing_tx(
-                        &pending.address,
-                        pending.chat_id,
-                        pending.txid.clone(),
-                        sent_amount,
-                        net_change_for_balance,
-                        pending.daa_score,
-                        virtual_daa_score,
-                    )
-                    .await?;
+                    info!(
+                        "Processing pending outgoing transaction {} from queue (chat_id: {}, sent_amount: {}, net_change: {})",
+                        pending.txid, pending.chat_id, sent_amount, net_change_for_balance
+                    );
+                    self.outgoing_handler
+                        .handle_outgoing_tx(
+                            &pending.address,
+                            pending.chat_id,
+                            pending.txid.clone(),
+                            sent_amount,
+                            net_change_for_balance,
+                            pending.daa_score,
+                            virtual_daa_score,
+                        )
+                        .await?;
                 }
+            } else {
+                warn!(
+                    "Pending transaction {} was marked as confirmed but not found in pending queue",
+                    txid
+                );
             }
         }
 

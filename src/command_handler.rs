@@ -466,10 +466,7 @@ TN12: <a href="http://pool.rustykaspa.org:3032/">http://pool.rustykaspa.org:3032
         }
 
         let total_kas = KaspaClient::sompi_to_kas(total_balance);
-        message.push_str(&format!(
-            "<b>Total Balance: {:.8} KAS</b>",
-            total_kas
-        ));
+        message.push_str(&format!("<b>Total Balance: {:.8} KAS</b>", total_kas));
 
         self.send_message(chat_id, &message).await?;
         Ok(())
@@ -494,8 +491,19 @@ TN12: <a href="http://pool.rustykaspa.org:3032/">http://pool.rustykaspa.org:3032
                 rewards.len()
             ));
 
-            // Show rewards in chronological order (oldest first)
-            for (i, reward) in rewards.iter().take(20).enumerate() {
+            // Sort rewards in descending chronological order (newest first)
+            // This ensures balance progression is logical (newer rewards show higher balances)
+            let mut sorted_rewards = rewards.clone();
+            sorted_rewards.sort_by(|a, b| {
+                // Sort by DAA score (newest first) as primary, then timestamp as tiebreaker
+                // DAA score is more reliable for chronological ordering in blockchain contexts
+                b.block_daa_score
+                    .cmp(&a.block_daa_score)
+                    .then_with(|| b.timestamp.cmp(&a.timestamp))
+            });
+
+            // Show rewards in descending chronological order (newest first)
+            for (i, reward) in sorted_rewards.iter().take(20).enumerate() {
                 let timestamp_seconds = if reward.timestamp > 1_000_000_000_000 {
                     reward.timestamp / 1000
                 } else {
@@ -522,8 +530,11 @@ TN12: <a href="http://pool.rustykaspa.org:3032/">http://pool.rustykaspa.org:3032
                 ));
             }
 
-            if rewards.len() > 20 {
-                message.push_str(&format!("... and {} more reward(s)", rewards.len() - 20));
+            if sorted_rewards.len() > 20 {
+                message.push_str(&format!(
+                    "... and {} more reward(s)",
+                    sorted_rewards.len() - 20
+                ));
             }
 
             self.send_message(chat_id, &message).await?;
