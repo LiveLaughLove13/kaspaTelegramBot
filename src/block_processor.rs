@@ -25,7 +25,10 @@ pub struct BlockRewardRecord {
 }
 
 pub struct PendingBlock {
+    pub id: String,
     pub block_hash: String,
+    pub coinbase_txid: String,
+    pub output_index: u32,
     pub address: String,
     pub chat_id: i64,
     pub reward: u64,
@@ -108,7 +111,12 @@ impl BlockProcessor {
                 }
 
                 // Check outputs for tracked addresses and store as pending
-                for output in &tx.outputs {
+                let Some(verbose_tx) = &tx.verbose_data else {
+                    continue;
+                };
+                let coinbase_txid = verbose_tx.transaction_id.to_string();
+
+                for (output_index, output) in tx.outputs.iter().enumerate() {
                     if let Some(verbose_data) = &output.verbose_data {
                         let address = &verbose_data.script_public_key_address;
                         let addr_str = address.to_string();
@@ -122,12 +130,17 @@ impl BlockProcessor {
                                 "Block reward {} detected, storing as pending (will check blue confirmation)",
                                 block_hash
                             );
+                            let reward_id =
+                                format!("{}:{}:{}:{}", block_hash, chat_id, addr_str, output_index);
                             let mut pending = self.pending_blocks.lock().await;
-                            if !pending.contains_key(&block_hash) {
+                            if !pending.contains_key(&reward_id) {
                                 pending.insert(
-                                    block_hash.clone(),
+                                    reward_id.clone(),
                                     PendingBlock {
+                                        id: reward_id,
                                         block_hash: block_hash.clone(),
+                                        coinbase_txid: coinbase_txid.clone(),
+                                        output_index: output_index as u32,
                                         address: addr_str,
                                         chat_id,
                                         reward,
@@ -146,15 +159,19 @@ impl BlockProcessor {
 
     // Verify that a block is blue confirmed and remains blue
     // This is the critical function that ensures we only process blue blocks
-    // Two-step process: check tip hashes first, then verify blue status
+    // Two-step process: best-effort tip-hash observation, then authoritative blue checks
     async fn verify_block_is_blue(&self, block_hash: &str) -> bool {
-        // Step 1: Check if block is in DAG tip hashes (bridge approach)
+        // Step 1: Best-effort check if block is in DAG tip hashes.
+        // A valid blue block may rotate out of current tips quickly on high-BPS DAGs,
+        // so this check must not hard-fail the block.
         const TIP_HASH_MAX_ATTEMPTS: u32 = 10;
         const TIP_HASH_RETRY_DELAY_MS: u64 = 2000;
+        let mut seen_in_tips = false;
 
         for attempt in 1..=TIP_HASH_MAX_ATTEMPTS {
             match self.kaspa_client.is_block_in_tip_hashes(block_hash).await {
                 Ok(true) => {
+                    seen_in_tips = true;
                     debug!(
                         "Block {} is in tip hashes (attempt {})",
                         block_hash, attempt
@@ -172,11 +189,10 @@ impl BlockProcessor {
                         ))
                         .await;
                     } else {
-                        warn!(
-                            "Block {} not in tip hashes after {} attempts, skipping",
+                        debug!(
+                            "Block {} not in tip hashes after {} attempts; continuing with blue checks",
                             block_hash, TIP_HASH_MAX_ATTEMPTS
                         );
-                        return false;
                     }
                 }
                 Err(e) => {
@@ -190,16 +206,26 @@ impl BlockProcessor {
                         ))
                         .await;
                     } else {
-                        return false;
+                        debug!(
+                            "Tip-hash checks exhausted for block {}; continuing with blue checks",
+                            block_hash
+                        );
                     }
                 }
             }
+        }
+        if !seen_in_tips {
+            debug!(
+                "Block {} was not observed in current tip hashes; relying on blue confirmation result",
+                block_hash
+            );
         }
 
         // Step 2: Verify blue status with retries (bridge approach)
         const BLOCK_CONFIRM_MAX_ATTEMPTS: u32 = 30;
         const BLOCK_CONFIRM_RETRY_DELAY_MS: u64 = 2000;
-        const REQUIRED_CONSECUTIVE_CONFIRMS: u32 = 5;
+        // Safer than single-shot (to avoid transient false positives), but less strict than 5.
+        const REQUIRED_CONSECUTIVE_CONFIRMS: u32 = 3;
 
         let mut consecutive_confirms = 0;
 
@@ -254,20 +280,24 @@ impl BlockProcessor {
         false
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn handle_block_reward(
         &self,
+        reward_id: &str,
         address: &str,
         chat_id: i64,
         block_hash: &str,
+        coinbase_txid: &str,
+        output_index: u32,
         reward: u64,
         block_daa_score: u64,
         virtual_daa_score: u64,
     ) -> Result<()> {
-        // Check if we've already notified about this block
+        // Check if we've already notified about this specific reward candidate
         {
             let notified = self.notified_blocks.lock().await;
-            if notified.contains(block_hash) {
-                debug!("Block {} already notified, skipping", block_hash);
+            if notified.contains(reward_id) {
+                debug!("Reward {} already notified, skipping", reward_id);
                 return Ok(());
             }
         }
@@ -288,7 +318,7 @@ impl BlockProcessor {
         {
             debug!("Block {} failed blue verification, skipping", block_hash);
             // Remove from pending since it's not blue
-            self.pending_blocks.lock().await.remove(block_hash);
+            self.pending_blocks.lock().await.remove(reward_id);
             return Ok(());
         }
 
@@ -305,6 +335,39 @@ impl BlockProcessor {
             return Ok(());
         }
 
+        // Final safety gate: ensure this exact coinbase output exists in UTXO set.
+        // This prevents notifying red/rejected rewards that never become spendable UTXOs.
+        let reward_utxo_exists = match self
+            .kaspa_client
+            .has_utxo_outpoint(address, coinbase_txid, output_index, reward)
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(
+                    "Failed checking reward UTXO existence for {}:{} ({}): {}",
+                    coinbase_txid, output_index, address, e
+                );
+                false
+            }
+        };
+        if !reward_utxo_exists {
+            // If sufficiently old and still missing, treat as non-crediting reward and drop it.
+            if daa_diff > confirmation_depth.saturating_add(120) {
+                warn!(
+                    "Dropping reward {} (block {}) - coinbase UTXO not found after DAA diff {}",
+                    reward_id, block_hash, daa_diff
+                );
+                self.pending_blocks.lock().await.remove(reward_id);
+            } else {
+                debug!(
+                    "Reward {} not yet present in UTXO set; keeping pending (DAA diff: {})",
+                    reward_id, daa_diff
+                );
+            }
+            return Ok(());
+        }
+
         // Block reward is blue confirmed AND DAA depth met - safe to process
         info!(
             "Processing blue block reward: {} (DAA diff: {}, blue verified)",
@@ -315,8 +378,8 @@ impl BlockProcessor {
         {
             let mut notified = self.notified_blocks.lock().await;
             let mut times = self.notified_blocks_times.lock().await;
-            notified.insert(block_hash.to_string());
-            times.insert(block_hash.to_string(), Instant::now());
+            notified.insert(reward_id.to_string());
+            times.insert(reward_id.to_string(), Instant::now());
         }
 
         let timestamp = chrono::Utc::now().timestamp_millis() as u64;
@@ -388,7 +451,7 @@ impl BlockProcessor {
             });
 
         // Remove from pending
-        self.pending_blocks.lock().await.remove(block_hash);
+        self.pending_blocks.lock().await.remove(reward_id);
 
         Ok(())
     }
@@ -439,7 +502,10 @@ impl BlockProcessor {
             pending
                 .values()
                 .map(|p| PendingBlock {
+                    id: p.id.clone(),
                     block_hash: p.block_hash.clone(),
+                    coinbase_txid: p.coinbase_txid.clone(),
+                    output_index: p.output_index,
                     address: p.address.clone(),
                     chat_id: p.chat_id,
                     reward: p.reward,
@@ -458,9 +524,12 @@ impl BlockProcessor {
             if daa_diff >= confirmation_depth {
                 // Process the block reward
                 self.handle_block_reward(
+                    &pending.id,
                     &pending.address,
                     pending.chat_id,
                     &pending.block_hash,
+                    &pending.coinbase_txid,
+                    pending.output_index,
                     pending.reward,
                     pending.daa_score,
                     virtual_daa_score,

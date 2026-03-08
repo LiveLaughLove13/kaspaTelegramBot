@@ -375,6 +375,37 @@ impl KaspaClient {
         }
     }
 
+    pub async fn has_utxo_outpoint(
+        &self,
+        address: &str,
+        txid: &str,
+        output_index: u32,
+        expected_amount: u64,
+    ) -> Result<bool> {
+        let addr = Address::try_from(address)
+            .with_context(|| format!("Failed to parse address: {}", address))?;
+        let txid_hash = RpcHash::from_str(txid)
+            .with_context(|| format!("Failed to parse transaction ID: {}", txid))?;
+        let target_txid = RpcTransactionId::from(txid_hash);
+
+        let response = self
+            .client
+            .get_utxos_by_addresses_call(None, GetUtxosByAddressesRequest::new(vec![addr]))
+            .await
+            .with_context(|| format!("Failed to get UTXOs for {}", address))?;
+
+        for entry in response.entries {
+            if entry.outpoint.transaction_id == target_txid
+                && entry.outpoint.index == output_index
+                && entry.utxo_entry.amount == expected_amount
+            {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
+
     // Check if a block is blue confirmed (in the selected chain)
     // Uses the same API as the bridge code: get_current_block_color_call
     pub async fn is_block_blue_confirmed(&self, block_hash: &str) -> Result<bool> {
