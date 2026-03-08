@@ -6,6 +6,7 @@ mod kaspa_client;
 mod outgoing_transaction;
 mod processor;
 mod telegram;
+mod transaction_sender;
 mod transaction_processor;
 
 use anyhow::{Context, Result};
@@ -17,6 +18,7 @@ use std::sync::Arc;
 use telegram::TelegramClient;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
+use transaction_sender::TransactionSender;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -57,6 +59,9 @@ async fn main() -> Result<()> {
         telegram_client.clone(),
         config.clone(),
     ));
+
+    // Create transaction sender from bot-config.toml wallet settings
+    let transaction_sender = Arc::new(TransactionSender::new(&config.wallet));
 
     // Get tracked addresses from config or environment variable (for backward compatibility)
     // These will be associated with the configured chat_id if provided
@@ -120,7 +125,11 @@ async fn main() -> Result<()> {
     }
 
     // Create command handler
-    let mut command_handler = CommandHandler::new(kaspa_client.clone(), telegram_client.clone());
+    let mut command_handler = CommandHandler::new(
+        kaspa_client.clone(),
+        telegram_client.clone(),
+        transaction_sender.clone(),
+    );
     command_handler.set_processor(processor.clone());
     let command_handler = Arc::new(command_handler);
 

@@ -32,6 +32,9 @@ impl TelegramClient {
             {"command": "balance", "description": "Check wallet balances"},
             {"command": "rewards", "description": "View recent block rewards"},
             {"command": "refresh", "description": "Refresh balances from blockchain"},
+            {"command": "send", "description": "Send KAS from your tracked wallet"},
+            {"command": "wallet", "description": "Manage your wallet credential session"},
+            {"command": "cancel", "description": "Cancel active send flow"},
             {"command": "mining", "description": "Show mining pool connection details"}
         ]);
 

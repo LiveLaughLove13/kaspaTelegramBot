@@ -1,5 +1,6 @@
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -8,6 +9,8 @@ pub struct Config {
     pub telegram: TelegramConfig,
     pub notifications: NotificationConfig,
     pub confirmation: ConfirmationConfig,
+    #[serde(default)]
+    pub wallet: WalletConfig,
     // Wallet addresses to track (optional, can also be set via environment variable)
     #[serde(default)]
     pub wallet_addresses: Vec<String>,
@@ -53,6 +56,52 @@ pub struct ConfirmationConfig {
     // virtual_daa_score - transaction_daa_score >= confirmation_depth
     #[serde(default = "default_confirmation_depth")]
     pub daa_score_depth: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum WalletMode {
+    #[default]
+    Watchonly,
+    Local,
+    External,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WalletSignerConfig {
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub api_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WalletConfig {
+    #[serde(default)]
+    pub send_enabled: bool,
+    #[serde(default)]
+    pub mode: WalletMode,
+    #[serde(default)]
+    pub node_address: String,
+    #[serde(default = "default_true")]
+    pub allow_user_credentials: bool,
+    #[serde(default)]
+    pub preconfigured_chat_private_keys: HashMap<String, String>,
+    #[serde(default)]
+    pub signer: WalletSignerConfig,
+}
+
+impl Default for WalletConfig {
+    fn default() -> Self {
+        Self {
+            send_enabled: false,
+            mode: WalletMode::Watchonly,
+            node_address: String::new(),
+            allow_user_credentials: true,
+            preconfigured_chat_private_keys: HashMap::new(),
+            signer: WalletSignerConfig::default(),
+        }
+    }
 }
 
 fn default_true() -> bool {
@@ -118,6 +167,23 @@ wallet_addresses = []
 #     "kaspa:qpxxxxxx...",
 #     "kaspa:qpyyyyyy...",
 # ]
+
+# Wallet send mode
+[wallet]
+# Master switch for /send
+send_enabled = false
+# Modes: "watchonly", "local", "external"
+mode = "watchonly"
+# RPC node used for sending in local mode (defaults to [kaspa].node_address if empty)
+node_address = ""
+# Allow users to provide their own private key credentials via Telegram command
+allow_user_credentials = true
+# Optional operator-provided keys per chat ID (string chat_id -> 64-char hex private key)
+preconfigured_chat_private_keys = {}
+# External signer settings (used when mode = "external")
+[wallet.signer]
+url = ""
+api_key = ""
 "#;
             fs::write(config_path, default_toml)?;
             anyhow::bail!(
@@ -136,6 +202,10 @@ wallet_addresses = []
             if !env_token.is_empty() {
                 config.telegram.bot_token = env_token;
             }
+        }
+
+        if config.wallet.node_address.trim().is_empty() {
+            config.wallet.node_address = config.kaspa.node_address.clone();
         }
 
         Ok(config)

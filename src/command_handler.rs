@@ -1,6 +1,8 @@
 use crate::kaspa_client::KaspaClient;
 use crate::processor::NotificationProcessor;
 use crate::telegram::TelegramClient;
+use crate::config::WalletMode;
+use crate::transaction_sender::{parse_kas_to_sompi, SendKaspaRequest, TransactionSender};
 use anyhow::{Context, Result};
 use kaspa_addresses::Address;
 use std::collections::HashMap;
@@ -12,18 +14,33 @@ use tracing::{info, warn};
 pub struct CommandHandler {
     kaspa_client: Arc<KaspaClient>,
     telegram_client: Arc<TelegramClient>,
+    transaction_sender: Arc<TransactionSender>,
     processor: Option<Arc<NotificationProcessor>>,
     // Rate limiting: track last command time per chat_id
     rate_limits: Arc<Mutex<HashMap<i64, Vec<Instant>>>>,
+    // Multi-step /send flow state per user
+    send_flows: Arc<Mutex<HashMap<i64, SendFlowState>>>,
+}
+
+#[derive(Debug, Clone)]
+enum SendFlowState {
+    AwaitingToAddress { from_address: String },
+    AwaitingAmount { from_address: String, to_address: String },
 }
 
 impl CommandHandler {
-    pub fn new(kaspa_client: Arc<KaspaClient>, telegram_client: Arc<TelegramClient>) -> Self {
+    pub fn new(
+        kaspa_client: Arc<KaspaClient>,
+        telegram_client: Arc<TelegramClient>,
+        transaction_sender: Arc<TransactionSender>,
+    ) -> Self {
         Self {
             kaspa_client,
             telegram_client,
+            transaction_sender,
             processor: None,
             rate_limits: Arc::new(Mutex::new(HashMap::new())),
+            send_flows: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -87,6 +104,15 @@ impl CommandHandler {
             let command = parts[0];
 
             match command {
+                "/cancel" => {
+                    let removed = self.send_flows.lock().await.remove(&chat_id).is_some();
+                    if removed {
+                        self.send_message(chat_id, "✅ Active send flow cancelled.").await?;
+                    } else {
+                        self.send_message(chat_id, "ℹ️ No active send flow to cancel.")
+                            .await?;
+                    }
+                }
                 "/start" | "/help" => {
                     self.send_help(chat_id).await?;
                 }
@@ -129,6 +155,12 @@ impl CommandHandler {
                 "/rewards" => {
                     self.handle_rewards(chat_id).await?;
                 }
+                "/send" => {
+                    self.handle_send(chat_id, &parts).await?;
+                }
+                "/wallet" => {
+                    self.handle_wallet(chat_id, &parts).await?;
+                }
                 _ => {
                     self.send_message(
                         chat_id,
@@ -138,6 +170,11 @@ impl CommandHandler {
                 }
             }
         } else {
+            // Continue /send flow if active
+            if self.try_handle_send_flow_step(chat_id, text).await? {
+                return Ok(());
+            }
+
             // Try to parse as an address
             if Address::try_from(text).is_ok() {
                 // It's a valid address, add it
@@ -165,6 +202,11 @@ impl CommandHandler {
 • <code>/balance</code> - Check wallet balances
 • <code>/rewards</code> - View recent block rewards
 • <code>/refresh</code> - Refresh balances from blockchain
+• <code>/send &lt;from&gt; &lt;to&gt; &lt;amount&gt;</code> - Send KAS from your wallet key
+• <code>/cancel</code> - Cancel active send flow
+• <code>/wallet status</code> - Show wallet credential state
+• <code>/wallet importpk &lt;hex&gt;</code> - Import your private key for this bot session
+• <code>/wallet clear</code> - Remove your session wallet credential
 • <code>/mining</code> - Show mining pool connection details
 • <code>/help</code> - Show this help message
 
@@ -175,8 +217,264 @@ Just send a Kaspa address (e.g., <code>kaspa:qpxxxxxx...</code>) to automaticall
 <code>/add kaspa:qpxxxxxx...</code>
 or simply:
 <code>kaspa:qpxxxxxx...</code>
+
+<b>Send Example:</b>
+<code>/send</code> then follow prompts
 "#;
         self.send_message(chat_id, help_text).await
+    }
+
+    async fn handle_wallet(&self, chat_id: i64, parts: &[&str]) -> Result<()> {
+        if parts.len() < 2 {
+            self.send_message(
+                chat_id,
+                "🔐 <b>Wallet Commands</b>\n\n<code>/wallet status</code>\n<code>/wallet importpk &lt;64-hex-private-key&gt;</code>\n<code>/wallet clear</code>",
+            )
+            .await?;
+            return Ok(());
+        }
+
+        match parts[1] {
+            "status" => {
+                let mode_label = match self.transaction_sender.mode() {
+                    WalletMode::Watchonly => "watchonly",
+                    WalletMode::Local => "local",
+                    WalletMode::External => "external",
+                };
+                let enabled = self.transaction_sender.is_enabled().await;
+                let has_credential = self.transaction_sender.has_user_private_key(chat_id).await;
+                let credential_mode = if self.transaction_sender.allow_user_credentials() {
+                    "enabled"
+                } else {
+                    "disabled"
+                };
+                let msg = format!(
+                    "🔐 <b>Wallet Status</b>\n\n\
+                    Mode: <code>{}</code>\n\
+                    Send enabled: <code>{}</code>\n\
+                    User credential commands: <code>{}</code>\n\
+                    Your credential loaded: <code>{}</code>",
+                    mode_label, enabled, credential_mode, has_credential
+                );
+                self.send_message(chat_id, &msg).await?;
+            }
+            "importpk" => {
+                if parts.len() < 3 {
+                    self.send_message(
+                        chat_id,
+                        "❌ <b>Usage:</b> <code>/wallet importpk &lt;64-hex-private-key&gt;</code>",
+                    )
+                    .await?;
+                    return Ok(());
+                }
+
+                match self
+                    .transaction_sender
+                    .set_user_private_key(chat_id, parts[2])
+                    .await
+                {
+                    Ok(_) => {
+                        self.send_message(
+                            chat_id,
+                            "✅ Wallet credential loaded for this session.\n\nUse <code>/send</code> to create and broadcast transactions.",
+                        )
+                        .await?;
+                    }
+                    Err(e) => {
+                        self.send_message(
+                            chat_id,
+                            &format!("❌ Failed to import credential: {}", e),
+                        )
+                        .await?;
+                    }
+                }
+            }
+            "clear" => {
+                let cleared = self.transaction_sender.clear_user_private_key(chat_id).await;
+                if cleared {
+                    self.send_message(chat_id, "✅ Wallet credential removed from this session.")
+                        .await?;
+                } else {
+                    self.send_message(chat_id, "ℹ️ No wallet credential was loaded for your chat.")
+                        .await?;
+                }
+            }
+            _ => {
+                self.send_message(
+                    chat_id,
+                    "❌ Unknown wallet subcommand. Use <code>/wallet status</code>, <code>/wallet importpk</code>, or <code>/wallet clear</code>.",
+                )
+                .await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn handle_send(&self, chat_id: i64, parts: &[&str]) -> Result<()> {
+        if !self.transaction_sender.is_enabled().await {
+            self.send_message(
+                chat_id,
+                "🔒 <b>Send is disabled</b>\n\nBot operator has disabled send mode in configuration.",
+            )
+            .await?;
+            return Ok(());
+        }
+
+        if parts.len() > 1 {
+            self.send_message(
+                chat_id,
+                "ℹ️ <b>Send Wizard</b>\n\nJust use <code>/send</code> without parameters and follow prompts.\nUse <code>/cancel</code> to abort.",
+            )
+            .await?;
+            return Ok(());
+        }
+
+        if !self.transaction_sender.has_user_private_key(chat_id).await {
+            self.send_message(
+                chat_id,
+                "🔑 No wallet credential loaded for your user.\n\nUse <code>/wallet importpk &lt;64-hex-private-key&gt;</code> first.",
+            )
+            .await?;
+            return Ok(());
+        }
+
+        let from_address = match self.transaction_sender.get_user_wallet_address(chat_id).await {
+            Ok(addr) => addr,
+            Err(e) => {
+                self.send_message(
+                    chat_id,
+                    &format!("❌ Unable to resolve your wallet address: {}", e),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+
+        self.send_flows.lock().await.insert(
+            chat_id,
+            SendFlowState::AwaitingToAddress {
+                from_address: from_address.clone(),
+            },
+        );
+        self.send_message(
+            chat_id,
+            &format!(
+                "🧾 <b>Send Wizard Started</b>\n\n<b>From:</b> <code>{}</code>\n\nReply with destination Kaspa address.\nUse <code>/cancel</code> to abort.",
+                from_address
+            ),
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    async fn try_handle_send_flow_step(&self, chat_id: i64, text: &str) -> Result<bool> {
+        let state = { self.send_flows.lock().await.get(&chat_id).cloned() };
+        let Some(state) = state else {
+            return Ok(false);
+        };
+
+        match state {
+            SendFlowState::AwaitingToAddress { from_address } => {
+                let to_address = match Address::try_from(text) {
+                    Ok(addr) => addr.to_string(),
+                    Err(e) => {
+                        self.send_message(
+                            chat_id,
+                            &format!(
+                                "❌ Invalid destination address: {}\n\nPlease enter a valid Kaspa address or <code>/cancel</code>.",
+                                e
+                            ),
+                        )
+                        .await?;
+                        return Ok(true);
+                    }
+                };
+                if to_address == from_address {
+                    self.send_message(
+                        chat_id,
+                        "❌ Destination cannot be the same as source address.\n\nEnter another address or <code>/cancel</code>.",
+                    )
+                    .await?;
+                    return Ok(true);
+                }
+
+                self.send_flows.lock().await.insert(
+                    chat_id,
+                    SendFlowState::AwaitingAmount {
+                        from_address: from_address.clone(),
+                        to_address: to_address.clone(),
+                    },
+                );
+                self.send_message(
+                    chat_id,
+                    &format!(
+                        "💸 <b>Destination Set</b>\n\n<b>From:</b> <code>{}</code>\n<b>To:</b> <code>{}</code>\n\nNow enter amount in KAS (example: <code>1.25</code>).",
+                        from_address, to_address
+                    ),
+                )
+                .await?;
+                Ok(true)
+            }
+            SendFlowState::AwaitingAmount {
+                from_address,
+                to_address,
+            } => {
+                let amount_sompi = match parse_kas_to_sompi(text) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        self.send_message(
+                            chat_id,
+                            &format!(
+                                "❌ Invalid amount: {}\n\nEnter amount in KAS (example: <code>1.25</code>) or <code>/cancel</code>.",
+                                e
+                            ),
+                        )
+                        .await?;
+                        return Ok(true);
+                    }
+                };
+
+                self.send_flows.lock().await.remove(&chat_id);
+                self.send_message(chat_id, "🛰️ Preparing and submitting signed transaction...")
+                    .await?;
+
+                let result = self
+                    .transaction_sender
+                    .send_kaspa(SendKaspaRequest {
+                        chat_id,
+                        from_address: from_address.clone(),
+                        to_address: to_address.clone(),
+                        amount_sompi,
+                    })
+                    .await;
+
+                match result {
+                    Ok(sent) => {
+                        let amount_kas = KaspaClient::sompi_to_kas(amount_sompi);
+                        self.send_message(
+                            chat_id,
+                            &format!(
+                                "✅ <b>Transaction Broadcasted</b>\n\n<b>From:</b> <code>{}</code>\n<b>To:</b> <code>{}</code>\n<b>Amount:</b> {:.8} KAS\n<b>TXID:</b> <a href=\"https://kaspa.stream/transactions/{}\">{}</a>",
+                                from_address, to_address, amount_kas, sent.txid, sent.txid
+                            ),
+                        )
+                        .await?;
+                    }
+                    Err(e) => {
+                        warn!("Send transaction request failed for chat {}: {}", chat_id, e);
+                        self.send_message(
+                            chat_id,
+                            "❌ Failed to sign/broadcast the transaction. Please verify wallet balance, destination address, and signer service health.",
+                        )
+                        .await?;
+                    }
+                }
+
+                Ok(true)
+            }
+        }
     }
 
     async fn handle_add_address(&self, chat_id: i64, address: &str) -> Result<()> {
