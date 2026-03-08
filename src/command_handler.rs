@@ -205,6 +205,7 @@ impl CommandHandler {
 • <code>/send &lt;from&gt; &lt;to&gt; &lt;amount&gt;</code> - Send KAS from your wallet key
 • <code>/cancel</code> - Cancel active send flow
 • <code>/wallet status</code> - Show wallet credential state
+• <code>/wallet balance</code> - Show balance for your imported wallet
 • <code>/wallet importpk &lt;hex&gt;</code> - Import your private key for this bot session
 • <code>/wallet clear</code> - Remove your session wallet credential
 • <code>/mining</code> - Show mining pool connection details
@@ -228,7 +229,7 @@ or simply:
         if parts.len() < 2 {
             self.send_message(
                 chat_id,
-                "🔐 <b>Wallet Commands</b>\n\n<code>/wallet status</code>\n<code>/wallet importpk &lt;64-hex-private-key&gt;</code>\n<code>/wallet clear</code>",
+                "🔐 <b>Wallet Commands</b>\n\n<code>/wallet status</code>\n<code>/wallet balance</code>\n<code>/wallet importpk &lt;64-hex-private-key&gt;</code>\n<code>/wallet clear</code>",
             )
             .await?;
             return Ok(());
@@ -257,6 +258,50 @@ or simply:
                     mode_label, enabled, credential_mode, has_credential
                 );
                 self.send_message(chat_id, &msg).await?;
+            }
+            "balance" => {
+                if !self.transaction_sender.has_user_private_key(chat_id).await {
+                    self.send_message(
+                        chat_id,
+                        "🔑 No wallet credential loaded for your user.\n\nUse <code>/wallet importpk &lt;64-hex-private-key&gt;</code> first.",
+                    )
+                    .await?;
+                    return Ok(());
+                }
+
+                let wallet_address = match self.transaction_sender.get_user_wallet_address(chat_id).await {
+                    Ok(addr) => addr,
+                    Err(e) => {
+                        self.send_message(
+                            chat_id,
+                            &format!("❌ Failed to resolve your wallet address: {}", e),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                };
+
+                let balance_sompi = match self.kaspa_client.get_balance(&wallet_address).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        self.send_message(
+                            chat_id,
+                            &format!("❌ Failed to fetch wallet balance: {}", e),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                };
+
+                let balance_kas = KaspaClient::sompi_to_kas(balance_sompi);
+                self.send_message(
+                    chat_id,
+                    &format!(
+                        "💰 <b>Wallet Balance</b>\n\n<b>Address:</b> <code>{}</code>\n<b>Balance:</b> <b>{:.8} KAS</b>",
+                        wallet_address, balance_kas
+                    ),
+                )
+                .await?;
             }
             "importpk" => {
                 if parts.len() < 3 {
@@ -302,7 +347,7 @@ or simply:
             _ => {
                 self.send_message(
                     chat_id,
-                    "❌ Unknown wallet subcommand. Use <code>/wallet status</code>, <code>/wallet importpk</code>, or <code>/wallet clear</code>.",
+                    "❌ Unknown wallet subcommand. Use <code>/wallet status</code>, <code>/wallet balance</code>, <code>/wallet importpk</code>, or <code>/wallet clear</code>.",
                 )
                 .await?;
             }
