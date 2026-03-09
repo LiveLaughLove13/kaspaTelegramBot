@@ -50,6 +50,10 @@ pub struct BlockProcessor {
 }
 
 impl BlockProcessor {
+    fn reward_balance_key(chat_id: i64, address: &str) -> String {
+        format!("{}:{}", chat_id, address)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         kaspa_client: Arc<KaspaClient>,
@@ -400,9 +404,12 @@ impl BlockProcessor {
         {
             // Keep a dedicated reward baseline that only advances when we actually notify.
             // This avoids duplicate confirmations caused by periodic refresh cache drift.
+            // IMPORTANT: baseline is per (chat_id, address), so multiple Telegram subscribers
+            // tracking the same address do not interfere with each other's notifications.
+            let reward_balance_key = Self::reward_balance_key(chat_id, address);
             let reward_balances = self.reward_notified_balances.lock().await;
             let baseline = reward_balances
-                .get(address)
+                .get(&reward_balance_key)
                 .copied()
                 .unwrap_or_else(|| current_balance.saturating_sub(reward));
             drop(reward_balances);
@@ -480,8 +487,9 @@ impl BlockProcessor {
             balances.insert(address.to_string(), new_balance);
         }
         if let Some(next_balance) = notify_balance_commit {
+            let reward_balance_key = Self::reward_balance_key(chat_id, address);
             let mut reward_balances = self.reward_notified_balances.lock().await;
-            reward_balances.insert(address.to_string(), next_balance);
+            reward_balances.insert(reward_balance_key, next_balance);
         }
 
         // Store block reward in history after successful notification
