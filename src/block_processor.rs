@@ -368,19 +368,11 @@ impl BlockProcessor {
             return Ok(());
         }
 
-        // Block reward is blue confirmed AND DAA depth met - safe to process
+        // Block reward is blue confirmed, deep enough, and UTXO-backed.
         info!(
             "Processing blue block reward: {} (DAA diff: {}, blue verified)",
             block_hash, daa_diff
         );
-
-        // Mark as notified
-        {
-            let mut notified = self.notified_blocks.lock().await;
-            let mut times = self.notified_blocks_times.lock().await;
-            notified.insert(reward_id.to_string());
-            times.insert(reward_id.to_string(), Instant::now());
-        }
 
         let timestamp = chrono::Utc::now().timestamp_millis() as u64;
 
@@ -400,13 +392,74 @@ impl BlockProcessor {
             }
         };
 
-        // The current balance already includes this reward, so subtract it to get the "before" balance
-        let previous_balance = current_balance.saturating_sub(reward);
-        let new_balance = current_balance;
-        let mut balances = self.address_balances.lock().await;
-        balances.insert(address.to_string(), new_balance);
+        let (previous_balance, new_balance) =
+            if self.config.confirmation.strict_balance_reconciliation {
+                // Final consistency gate:
+                // only notify when this reward can be reconciled against cached spendable balance.
+                // This avoids duplicate/rejected reward notifications that would otherwise produce
+                // identical previous/new balances across multiple block hashes.
+                let balances = self.address_balances.lock().await;
+                let cached_before = balances.get(address).copied();
+                drop(balances);
 
-        // Store block reward in history
+                if let Some(cached) = cached_before {
+                    let required_after_reward = cached.saturating_add(reward);
+                    if current_balance < required_after_reward {
+                        debug!(
+                            "Balance reconciliation fallback for reward {} (block {}): current {}, cached {}, reward {}, daa_diff {}",
+                            reward_id, block_hash, current_balance, cached, reward, daa_diff
+                        );
+                        let prev = current_balance.saturating_sub(reward);
+                        let next = current_balance;
+                        (prev, next)
+                    } else {
+                        let prev = cached;
+                        let next = required_after_reward;
+                        (prev, next)
+                    }
+                } else {
+                    // Fallback for first observation when cache is empty.
+                    let prev = current_balance.saturating_sub(reward);
+                    let next = current_balance;
+                    (prev, next)
+                }
+            } else {
+                let prev = current_balance.saturating_sub(reward);
+                let next = current_balance;
+                (prev, next)
+            };
+
+        // Send notification to the specific user
+        let notify_result = self
+            .telegram_client
+            .send_block_reward_to_chat(
+                chat_id,
+                address,
+                KaspaClient::sompi_to_kas(reward),
+                KaspaClient::sompi_to_kas(previous_balance),
+                KaspaClient::sompi_to_kas(new_balance),
+                block_hash,
+                block_daa_score,
+                timestamp,
+            )
+            .await;
+
+        if let Err(e) = notify_result {
+                error!(
+                    "Failed to send Telegram notification to chat {}: {}",
+                    chat_id, e
+                );
+            // Keep pending so we can retry later.
+            return Ok(());
+        }
+
+        // Update cached balance only after successful notification
+        {
+            let mut balances = self.address_balances.lock().await;
+            balances.insert(address.to_string(), new_balance);
+        }
+
+        // Store block reward in history after successful notification
         {
             let reward_kas = KaspaClient::sompi_to_kas(reward);
             let prev_balance_kas = KaspaClient::sompi_to_kas(previous_balance);
@@ -430,25 +483,13 @@ impl BlockProcessor {
             }
         }
 
-        // Send notification to the specific user
-        self.telegram_client
-            .send_block_reward_to_chat(
-                chat_id,
-                address,
-                KaspaClient::sompi_to_kas(reward),
-                KaspaClient::sompi_to_kas(previous_balance),
-                KaspaClient::sompi_to_kas(new_balance),
-                block_hash,
-                block_daa_score,
-                timestamp,
-            )
-            .await
-            .unwrap_or_else(|e| {
-                error!(
-                    "Failed to send Telegram notification to chat {}: {}",
-                    chat_id, e
-                )
-            });
+        // Mark as notified after successful notification
+        {
+            let mut notified = self.notified_blocks.lock().await;
+            let mut times = self.notified_blocks_times.lock().await;
+            notified.insert(reward_id.to_string());
+            times.insert(reward_id.to_string(), Instant::now());
+        }
 
         // Remove from pending
         self.pending_blocks.lock().await.remove(reward_id);

@@ -56,6 +56,9 @@ pub struct ConfirmationConfig {
     // virtual_daa_score - transaction_daa_score >= confirmation_depth
     #[serde(default = "default_confirmation_depth")]
     pub daa_score_depth: u64,
+    // Enforce that block reward notifications reconcile with observed balance increase
+    #[serde(default = "default_true")]
+    pub strict_balance_reconciliation: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -156,6 +159,8 @@ blue_blocks_only = true
 # virtual_daa_score - transaction_daa_score >= daa_score_depth
 # Recommended: 10-20 for faster notifications, higher for more security
 daa_score_depth = 10
+# Require reward notifications to match observable balance increase
+strict_balance_reconciliation = true
 
 # Wallet addresses to track (OPTIONAL - for backward compatibility)
 # These addresses will be associated with the chat_id above (if provided)
