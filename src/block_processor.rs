@@ -41,6 +41,7 @@ pub struct BlockProcessor {
     config: Arc<Config>,
     pending_blocks: Arc<Mutex<HashMap<String, PendingBlock>>>,
     address_balances: Arc<Mutex<HashMap<String, u64>>>,
+    reward_notified_balances: Arc<Mutex<HashMap<String, u64>>>,
     notified_blocks: Arc<Mutex<HashSet<String>>>,
     notified_blocks_times: Arc<Mutex<HashMap<String, Instant>>>,
     block_rewards_history: Arc<Mutex<HashMap<i64, Vec<BlockRewardRecord>>>>,
@@ -68,6 +69,7 @@ impl BlockProcessor {
             config,
             pending_blocks,
             address_balances,
+            reward_notified_balances: Arc::new(Mutex::new(HashMap::new())),
             notified_blocks,
             notified_blocks_times,
             block_rewards_history,
@@ -392,42 +394,60 @@ impl BlockProcessor {
             }
         };
 
-        let (previous_balance, new_balance) =
-            if self.config.confirmation.strict_balance_reconciliation {
-                // Final consistency gate:
-                // only notify when this reward can be reconciled against cached spendable balance.
-                // This avoids duplicate/rejected reward notifications that would otherwise produce
-                // identical previous/new balances across multiple block hashes.
-                let balances = self.address_balances.lock().await;
-                let cached_before = balances.get(address).copied();
-                drop(balances);
+        let mut notify_balance_commit: Option<u64> = None;
+        let (previous_balance, new_balance) = if self.config.confirmation.strict_balance_reconciliation
+        {
+            // Keep a dedicated reward baseline that only advances when we actually notify.
+            // This avoids duplicate confirmations caused by periodic refresh cache drift.
+            let reward_balances = self.reward_notified_balances.lock().await;
+            let baseline = reward_balances
+                .get(address)
+                .copied()
+                .unwrap_or_else(|| current_balance.saturating_sub(reward));
+            drop(reward_balances);
 
-                if let Some(cached) = cached_before {
-                    let required_after_reward = cached.saturating_add(reward);
-                    if current_balance < required_after_reward {
-                        debug!(
-                            "Balance reconciliation fallback for reward {} (block {}): current {}, cached {}, reward {}, daa_diff {}",
-                            reward_id, block_hash, current_balance, cached, reward, daa_diff
-                        );
-                        let prev = current_balance.saturating_sub(reward);
-                        let next = current_balance;
-                        (prev, next)
-                    } else {
-                        let prev = cached;
-                        let next = required_after_reward;
-                        (prev, next)
-                    }
+            if current_balance <= baseline {
+                if daa_diff > confirmation_depth.saturating_add(120) {
+                    warn!(
+                        "Dropping reward {} (block {}) - no new balance delta (current {}, baseline {}, reward {}, daa_diff {})",
+                        reward_id, block_hash, current_balance, baseline, reward, daa_diff
+                    );
+                    self.pending_blocks.lock().await.remove(reward_id);
                 } else {
-                    // Fallback for first observation when cache is empty.
-                    let prev = current_balance.saturating_sub(reward);
-                    let next = current_balance;
-                    (prev, next)
+                    debug!(
+                        "Keeping reward {} pending - no new balance delta yet (current {}, baseline {}, reward {}, daa_diff {})",
+                        reward_id, current_balance, baseline, reward, daa_diff
+                    );
                 }
-            } else {
-                let prev = current_balance.saturating_sub(reward);
-                let next = current_balance;
-                (prev, next)
-            };
+                return Ok(());
+            }
+
+            let available_delta = current_balance.saturating_sub(baseline);
+            if available_delta < reward {
+                if daa_diff > confirmation_depth.saturating_add(120) {
+                    warn!(
+                        "Dropping reward {} (block {}) - insufficient balance delta (current {}, baseline {}, reward {}, delta {}, daa_diff {})",
+                        reward_id, block_hash, current_balance, baseline, reward, available_delta, daa_diff
+                    );
+                    self.pending_blocks.lock().await.remove(reward_id);
+                } else {
+                    debug!(
+                        "Keeping reward {} pending - balance delta below reward (current {}, baseline {}, reward {}, delta {}, daa_diff {})",
+                        reward_id, current_balance, baseline, reward, available_delta, daa_diff
+                    );
+                }
+                return Ok(());
+            }
+
+            let prev = baseline;
+            let next = baseline.saturating_add(reward);
+            notify_balance_commit = Some(next);
+            (prev, next)
+        } else {
+            let prev = current_balance.saturating_sub(reward);
+            let next = current_balance;
+            (prev, next)
+        };
 
         // Send notification to the specific user
         let notify_result = self
@@ -457,6 +477,10 @@ impl BlockProcessor {
         {
             let mut balances = self.address_balances.lock().await;
             balances.insert(address.to_string(), new_balance);
+        }
+        if let Some(next_balance) = notify_balance_commit {
+            let mut reward_balances = self.reward_notified_balances.lock().await;
+            reward_balances.insert(address.to_string(), next_balance);
         }
 
         // Store block reward in history after successful notification
