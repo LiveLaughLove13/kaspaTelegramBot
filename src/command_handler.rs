@@ -1,7 +1,7 @@
+use crate::config::WalletMode;
 use crate::kaspa_client::KaspaClient;
 use crate::processor::NotificationProcessor;
 use crate::telegram::TelegramClient;
-use crate::config::WalletMode;
 use crate::transaction_sender::{parse_kas_to_sompi, SendKaspaRequest, TransactionSender};
 use anyhow::{Context, Result};
 use kaspa_addresses::Address;
@@ -24,8 +24,13 @@ pub struct CommandHandler {
 
 #[derive(Debug, Clone)]
 enum SendFlowState {
-    AwaitingToAddress { from_address: String },
-    AwaitingAmount { from_address: String, to_address: String },
+    AwaitingToAddress {
+        from_address: String,
+    },
+    AwaitingAmount {
+        from_address: String,
+        to_address: String,
+    },
 }
 
 impl CommandHandler {
@@ -107,7 +112,8 @@ impl CommandHandler {
                 "/cancel" => {
                     let removed = self.send_flows.lock().await.remove(&chat_id).is_some();
                     if removed {
-                        self.send_message(chat_id, "✅ Active send flow cancelled.").await?;
+                        self.send_message(chat_id, "✅ Active send flow cancelled.")
+                            .await?;
                     } else {
                         self.send_message(chat_id, "ℹ️ No active send flow to cancel.")
                             .await?;
@@ -269,7 +275,11 @@ or simply:
                     return Ok(());
                 }
 
-                let wallet_address = match self.transaction_sender.get_user_wallet_address(chat_id).await {
+                let wallet_address = match self
+                    .transaction_sender
+                    .get_user_wallet_address(chat_id)
+                    .await
+                {
                     Ok(addr) => addr,
                     Err(e) => {
                         self.send_message(
@@ -335,7 +345,10 @@ or simply:
                 }
             }
             "clear" => {
-                let cleared = self.transaction_sender.clear_user_private_key(chat_id).await;
+                let cleared = self
+                    .transaction_sender
+                    .clear_user_private_key(chat_id)
+                    .await;
                 if cleared {
                     self.send_message(chat_id, "✅ Wallet credential removed from this session.")
                         .await?;
@@ -384,7 +397,11 @@ or simply:
             return Ok(());
         }
 
-        let from_address = match self.transaction_sender.get_user_wallet_address(chat_id).await {
+        let from_address = match self
+            .transaction_sender
+            .get_user_wallet_address(chat_id)
+            .await
+        {
             Ok(addr) => addr,
             Err(e) => {
                 self.send_message(
@@ -508,7 +525,10 @@ or simply:
                         .await?;
                     }
                     Err(e) => {
-                        warn!("Send transaction request failed for chat {}: {}", chat_id, e);
+                        warn!(
+                            "Send transaction request failed for chat {}: {}",
+                            chat_id, e
+                        );
                         self.send_message(
                             chat_id,
                             "❌ Failed to sign/broadcast the transaction. Please verify wallet balance, destination address, and signer service health.",

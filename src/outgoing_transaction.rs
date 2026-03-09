@@ -9,7 +9,11 @@ use std::time::Instant;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
-fn should_store_outgoing_pending(is_in_block: bool, daa_diff: u64, confirmation_depth: u64) -> bool {
+fn should_store_outgoing_pending(
+    is_in_block: bool,
+    daa_diff: u64,
+    confirmation_depth: u64,
+) -> bool {
     !is_in_block && daa_diff < confirmation_depth
 }
 
@@ -123,10 +127,7 @@ impl OutgoingTransactionHandler {
                     txid, chat_id, address
                 );
             } else {
-                info!(
-                    "Outgoing transaction {} already in pending queue",
-                    txid
-                );
+                info!("Outgoing transaction {} already in pending queue", txid);
             }
             return Ok(());
         }
@@ -210,7 +211,7 @@ impl OutgoingTransactionHandler {
         // The blockchain balance already includes this transaction, so we calculate previous balance
         // For outgoing transactions: current_balance = previous_balance - net_change
         // So: previous_balance = current_balance + net_change
-        // 
+        //
         // IMPORTANT: net_change represents the amount that left the address:
         // net_change = removed_amount - added_amount = (amount_sent + fee) - change_returned
         let current_balance = match self.kaspa_client.get_balance(address).await {
@@ -242,10 +243,10 @@ impl OutgoingTransactionHandler {
                 sent_amount, txid
             );
         }
-        
+
         let (previous_balance, new_balance) =
             calculate_outgoing_balances(current_balance, net_change);
-        
+
         // Validate balance calculation makes sense
         if previous_balance < new_balance {
             warn!(
@@ -283,7 +284,7 @@ impl OutgoingTransactionHandler {
         // net_change is used for balance calculation (removed - added)
         info!(
             "Sending outgoing transaction notification to chat {} for txid {} (sent: {} KAS, fee: {} KAS, prev_balance: {} KAS, new_balance: {} KAS)",
-            chat_id, 
+            chat_id,
             txid,
             KaspaClient::sompi_to_kas(sent_amount),
             KaspaClient::sompi_to_kas(fee),
@@ -304,7 +305,7 @@ impl OutgoingTransactionHandler {
                 timestamp,
             )
             .await;
-        
+
         match notification_result {
             Ok(_) => {
                 info!(

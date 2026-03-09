@@ -6,8 +6,8 @@ mod kaspa_client;
 mod outgoing_transaction;
 mod processor;
 mod telegram;
-mod transaction_sender;
 mod transaction_processor;
+mod transaction_sender;
 
 use anyhow::{Context, Result};
 use command_handler::CommandHandler;

@@ -9,7 +9,11 @@ use std::time::Instant;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
-fn should_store_incoming_pending(is_in_block: bool, daa_diff: u64, confirmation_depth: u64) -> bool {
+fn should_store_incoming_pending(
+    is_in_block: bool,
+    daa_diff: u64,
+    confirmation_depth: u64,
+) -> bool {
     !is_in_block && daa_diff < confirmation_depth
 }
 
@@ -139,7 +143,11 @@ impl IncomingTransactionHandler {
 
         // Get actual received amount from transaction outputs (more accurate than UTXO calculation)
         // For incoming transactions, we want the sum of outputs TO the tracked address
-        let actual_received_amount = match self.kaspa_client.get_transaction_sent_amount(&txid, address).await {
+        let actual_received_amount = match self
+            .kaspa_client
+            .get_transaction_sent_amount(&txid, address)
+            .await
+        {
             Ok(Some((_sent_to_others, received_to_tracked))) => {
                 // received_to_tracked is the amount that came to the tracked address
                 if received_to_tracked > 0 {

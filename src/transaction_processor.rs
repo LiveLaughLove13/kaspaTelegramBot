@@ -277,16 +277,17 @@ impl TransactionProcessor {
             "Processing {} addresses from UtxosChanged notification",
             address_data.len()
         );
-        for (_, (address, chat_id, removed_amount, added_amount, tx_daa_score, txid)) in address_data
+        for (_, (address, chat_id, removed_amount, added_amount, tx_daa_score, txid)) in
+            address_data
         {
             info!(
                 "Processing transaction for address {}: removed={} sompi ({} KAS), added={} sompi ({} KAS), txid={}, daa_score={}, chat_id={}",
-                address, 
-                removed_amount, 
+                address,
+                removed_amount,
                 KaspaClient::sompi_to_kas(removed_amount),
                 added_amount,
                 KaspaClient::sompi_to_kas(added_amount),
-                txid, 
+                txid,
                 tx_daa_score,
                 chat_id
             );
@@ -353,195 +354,201 @@ impl TransactionProcessor {
             // This MUST be checked before outgoing to avoid misclassification
             match classify_net_direction(removed_amount, added_amount) {
                 NetDirection::PureIncoming => {
-                // Pure incoming transaction (no inputs from this address, only outputs to it)
-                info!(
+                    // Pure incoming transaction (no inputs from this address, only outputs to it)
+                    info!(
                     "Processing PURE INCOMING transaction {} for address {}: removed={}, added={}",
                     txid, address, removed_amount, added_amount
                 );
-                if self.config.notifications.incoming_tx {
-                    self.incoming_handler
-                        .handle_incoming_tx(
-                            &address,
-                            chat_id,
-                            txid.clone(),
-                            added_amount,
-                            tx_daa_score,
-                            virtual_daa_score,
-                        )
-                        .await?;
-                } else {
-                    debug!(
-                        "Skipping incoming transaction {}: notifications disabled",
-                        txid
-                    );
+                    if self.config.notifications.incoming_tx {
+                        self.incoming_handler
+                            .handle_incoming_tx(
+                                &address,
+                                chat_id,
+                                txid.clone(),
+                                added_amount,
+                                tx_daa_score,
+                                virtual_daa_score,
+                            )
+                            .await?;
+                    } else {
+                        debug!(
+                            "Skipping incoming transaction {}: notifications disabled",
+                            txid
+                        );
+                    }
+                    continue; // IMPORTANT: Skip to next address to avoid processing as outgoing
                 }
-                continue; // IMPORTANT: Skip to next address to avoid processing as outgoing
-            }
                 NetDirection::PureOutgoing => {
-                // Pure outgoing with no change
-                // For pure outgoing, removed_amount is both the sent amount and net change (no change returned)
-                debug!(
+                    // Pure outgoing with no change
+                    // For pure outgoing, removed_amount is both the sent amount and net change (no change returned)
+                    debug!(
                     "Processing pure outgoing transaction {} for address {}: removed={}, added={}",
                     txid, address, removed_amount, added_amount
                 );
-                if self.config.notifications.outgoing_tx {
-                    self.outgoing_handler
-                        .handle_outgoing_tx(
-                            &address,
-                            chat_id,
-                            txid.clone(),
-                            removed_amount, // Sent amount (no change, so this is the full amount)
-                            removed_amount, // Net change (same as sent since no change)
-                            tx_daa_score,
-                            virtual_daa_score,
-                        )
-                        .await?;
+                    if self.config.notifications.outgoing_tx {
+                        self.outgoing_handler
+                            .handle_outgoing_tx(
+                                &address,
+                                chat_id,
+                                txid.clone(),
+                                removed_amount, // Sent amount (no change, so this is the full amount)
+                                removed_amount, // Net change (same as sent since no change)
+                                tx_daa_score,
+                                virtual_daa_score,
+                            )
+                            .await?;
+                    }
                 }
-            }
                 NetDirection::NetIncoming(net_incoming) => {
-                // Net incoming transaction (received more than spent)
-                info!(
+                    // Net incoming transaction (received more than spent)
+                    info!(
                     "Processing INCOMING transaction {} for address {}: removed={}, added={}, net={}",
                     txid, address, removed_amount, added_amount, net_incoming
                 );
-                if self.config.notifications.incoming_tx && net_incoming > 0 {
-                    self.incoming_handler
-                        .handle_incoming_tx(
-                            &address,
-                            chat_id,
-                            txid.clone(),
-                            net_incoming,
-                            tx_daa_score,
-                            virtual_daa_score,
-                        )
-                        .await?;
-                } else {
-                    debug!(
+                    if self.config.notifications.incoming_tx && net_incoming > 0 {
+                        self.incoming_handler
+                            .handle_incoming_tx(
+                                &address,
+                                chat_id,
+                                txid.clone(),
+                                net_incoming,
+                                tx_daa_score,
+                                virtual_daa_score,
+                            )
+                            .await?;
+                    } else {
+                        debug!(
                         "Skipping incoming transaction {}: notifications disabled or net_incoming is 0",
                         txid
                     );
+                    }
+                    continue; // IMPORTANT: Skip to next address to avoid processing as outgoing
                 }
-                continue; // IMPORTANT: Skip to next address to avoid processing as outgoing
-            }
                 NetDirection::NetOutgoing(net_outgoing) => {
-                // Net outgoing transaction (spent more than received back as change)
-                info!(
+                    // Net outgoing transaction (spent more than received back as change)
+                    info!(
                     "OUTGOING TX {} for {}: removed={} sompi, added={} sompi, net_outgoing={} sompi",
                     txid, address, removed_amount, added_amount, net_outgoing
                 );
-                
-                // Log notification settings for debugging
-                info!(
-                    "Outgoing notification settings: enabled={}, net_outgoing={}",
-                    self.config.notifications.outgoing_tx, net_outgoing
-                );
 
-                // Try to get transaction from mempool NOW to calculate actual sent amount from outputs
-                // This is critical because once the transaction is confirmed, we can't get it from mempool
-                let actual_sent_amount = if let Ok(Some(mempool_entry)) =
-                    self.kaspa_client.get_mempool_entry(&txid).await
-                {
-                    // Transaction is in mempool - calculate actual sent amount from outputs
-                    // IMPORTANT: Sum outputs NOT to the tracked address (these are the actual sent amounts)
-                    // Outputs TO the tracked address are change and should be excluded
-                    let tx = &mempool_entry.transaction;
-                    let mut total_sent: u64 = 0;
-                    let mut received_to_tracked: u64 = 0;
-                    for output in &tx.outputs {
-                        if let Some(verbose_data) = &output.verbose_data {
-                            let output_address = verbose_data.script_public_key_address.to_string();
-                            if output_address == address {
-                                // This is an output TO the tracked address (change or received)
-                                received_to_tracked += output.value;
-                            } else {
-                                // This is an output to another address (the actual amount sent)
-                                total_sent += output.value;
+                    // Log notification settings for debugging
+                    info!(
+                        "Outgoing notification settings: enabled={}, net_outgoing={}",
+                        self.config.notifications.outgoing_tx, net_outgoing
+                    );
+
+                    // Try to get transaction from mempool NOW to calculate actual sent amount from outputs
+                    // This is critical because once the transaction is confirmed, we can't get it from mempool
+                    let actual_sent_amount = if let Ok(Some(mempool_entry)) =
+                        self.kaspa_client.get_mempool_entry(&txid).await
+                    {
+                        // Transaction is in mempool - calculate actual sent amount from outputs
+                        // IMPORTANT: Sum outputs NOT to the tracked address (these are the actual sent amounts)
+                        // Outputs TO the tracked address are change and should be excluded
+                        let tx = &mempool_entry.transaction;
+                        let mut total_sent: u64 = 0;
+                        let mut received_to_tracked: u64 = 0;
+                        for output in &tx.outputs {
+                            if let Some(verbose_data) = &output.verbose_data {
+                                let output_address =
+                                    verbose_data.script_public_key_address.to_string();
+                                if output_address == address {
+                                    // This is an output TO the tracked address (change or received)
+                                    received_to_tracked += output.value;
+                                } else {
+                                    // This is an output to another address (the actual amount sent)
+                                    total_sent += output.value;
+                                }
                             }
                         }
-                    }
-                    if total_sent > 0 {
-                        info!(
+                        if total_sent > 0 {
+                            info!(
                             "Transaction {}: Calculated from outputs - sent to others: {} sompi, received to tracked address: {} sompi, UTXO net: {} sompi",
                             txid, total_sent, received_to_tracked, net_outgoing
                         );
-                        Some(total_sent)
-                    } else {
-                        warn!(
+                            Some(total_sent)
+                        } else {
+                            warn!(
                             "Transaction {}: No outputs to other addresses found (only {} sompi to tracked address). This shouldn't happen for outgoing transactions.",
                             txid, received_to_tracked
                         );
-                        None
-                    }
-                } else {
-                    // Transaction not in mempool (already confirmed) - cannot get transaction outputs from node
-                    // For regular outgoing transactions (removed > added), UTXO net calculation is accurate
-                    // This represents the actual net amount that left the address (sent + fee - change)
-                    info!(
+                            None
+                        }
+                    } else {
+                        // Transaction not in mempool (already confirmed) - cannot get transaction outputs from node
+                        // For regular outgoing transactions (removed > added), UTXO net calculation is accurate
+                        // This represents the actual net amount that left the address (sent + fee - change)
+                        info!(
                         "Transaction {} not in mempool (already confirmed). Using UTXO net calculation: {} sompi ({} KAS) as sent amount.",
                         txid,
                         net_outgoing,
                         KaspaClient::sompi_to_kas(net_outgoing)
                     );
-                    None
-                };
-                if self.config.notifications.outgoing_tx && net_outgoing > 0 {
-                    // Use actual sent amount from outputs if available, otherwise use UTXO net
-                    // IMPORTANT: We pass both the sent amount (for display) and net change (for balance)
-                    let sent_amount_for_display = actual_sent_amount.unwrap_or(net_outgoing);
-                    info!(
+                        None
+                    };
+                    if self.config.notifications.outgoing_tx && net_outgoing > 0 {
+                        // Use actual sent amount from outputs if available, otherwise use UTXO net
+                        // IMPORTANT: We pass both the sent amount (for display) and net change (for balance)
+                        let sent_amount_for_display = actual_sent_amount.unwrap_or(net_outgoing);
+                        info!(
                         "Calling handle_outgoing_tx for txid {}: sent_amount={} sompi ({} KAS), net_change={} sompi ({} KAS), chat_id={}",
-                        txid, 
-                        sent_amount_for_display, 
+                        txid,
+                        sent_amount_for_display,
                         KaspaClient::sompi_to_kas(sent_amount_for_display),
                         net_outgoing,
                         KaspaClient::sompi_to_kas(net_outgoing),
                         chat_id
                     );
-                    // Validate net_change makes sense
-                    if net_outgoing == 0 && sent_amount_for_display > 0 {
-                        warn!(
+                        // Validate net_change makes sense
+                        if net_outgoing == 0 && sent_amount_for_display > 0 {
+                            warn!(
                             "WARNING: net_change is 0 but sent_amount is {} for transaction {} - this might be a self-transfer that should be skipped",
                             sent_amount_for_display, txid
                         );
-                    }
-                    // IMPORTANT: Don't mark as notified here - let the handler do it AFTER successfully sending
-                    // This ensures that if notification fails, we can retry
-                    self.outgoing_handler
-                        .handle_outgoing_tx(
-                            &address,
-                            chat_id,
-                            txid.clone(),
-                            sent_amount_for_display, // Amount to display (actual sent to recipients)
-                            net_outgoing, // Net change for balance calculation (removed - added)
-                            tx_daa_score,
-                            virtual_daa_score,
-                        )
-                        .await?;
-                } else {
-                    warn!(
+                        }
+                        // IMPORTANT: Don't mark as notified here - let the handler do it AFTER successfully sending
+                        // This ensures that if notification fails, we can retry
+                        self.outgoing_handler
+                            .handle_outgoing_tx(
+                                &address,
+                                chat_id,
+                                txid.clone(),
+                                sent_amount_for_display, // Amount to display (actual sent to recipients)
+                                net_outgoing, // Net change for balance calculation (removed - added)
+                                tx_daa_score,
+                                virtual_daa_score,
+                            )
+                            .await?;
+                    } else {
+                        warn!(
                         "Skipping outgoing transaction {}: notifications enabled={}, net_outgoing={} sompi ({} KAS)",
-                        txid, 
-                        self.config.notifications.outgoing_tx, 
+                        txid,
+                        self.config.notifications.outgoing_tx,
                         net_outgoing,
                         KaspaClient::sompi_to_kas(net_outgoing)
                     );
+                    }
                 }
-            }
                 NetDirection::EqualNonZero => {
-                // removed_amount == added_amount: Need to check transaction outputs to determine direction
-                // This could be:
-                // 1. Incoming transaction where sender also sent change back to themselves (rare but possible)
-                // 2. Outgoing transaction where change equals what was sent (self-transfer)
-                // 3. Mixed transaction
-                
-                // Get transaction details to determine if it's incoming or outgoing
-                match self.kaspa_client.get_transaction_sent_amount(&txid, &address).await {
-                    Ok(Some((sent_to_others, received_to_tracked))) => {
-                        // We have transaction details - determine direction based on outputs
-                        if received_to_tracked > sent_to_others {
-                            // More received than sent - this is an incoming transaction
-                            let net_incoming = received_to_tracked.saturating_sub(sent_to_others);
-                            info!(
+                    // removed_amount == added_amount: Need to check transaction outputs to determine direction
+                    // This could be:
+                    // 1. Incoming transaction where sender also sent change back to themselves (rare but possible)
+                    // 2. Outgoing transaction where change equals what was sent (self-transfer)
+                    // 3. Mixed transaction
+
+                    // Get transaction details to determine if it's incoming or outgoing
+                    match self
+                        .kaspa_client
+                        .get_transaction_sent_amount(&txid, &address)
+                        .await
+                    {
+                        Ok(Some((sent_to_others, received_to_tracked))) => {
+                            // We have transaction details - determine direction based on outputs
+                            if received_to_tracked > sent_to_others {
+                                // More received than sent - this is an incoming transaction
+                                let net_incoming =
+                                    received_to_tracked.saturating_sub(sent_to_others);
+                                info!(
                                 "Transaction {} (removed==added): Determined as INCOMING from outputs - received: {} sompi ({} KAS), sent: {} sompi ({} KAS), net_incoming: {} sompi ({} KAS)",
                                 txid,
                                 received_to_tracked,
@@ -551,22 +558,22 @@ impl TransactionProcessor {
                                 net_incoming,
                                 KaspaClient::sompi_to_kas(net_incoming)
                             );
-                            if self.config.notifications.incoming_tx && net_incoming > 0 {
-                                self.incoming_handler
-                                    .handle_incoming_tx(
-                                        &address,
-                                        chat_id,
-                                        txid.clone(),
-                                        received_to_tracked, // Use actual received amount
-                                        tx_daa_score,
-                                        virtual_daa_score,
-                                    )
-                                    .await?;
-                            }
-                            continue; // Skip to next address
-                        } else if sent_to_others > 0 {
-                            // Has outputs to other addresses - this is an outgoing transaction
-                            info!(
+                                if self.config.notifications.incoming_tx && net_incoming > 0 {
+                                    self.incoming_handler
+                                        .handle_incoming_tx(
+                                            &address,
+                                            chat_id,
+                                            txid.clone(),
+                                            received_to_tracked, // Use actual received amount
+                                            tx_daa_score,
+                                            virtual_daa_score,
+                                        )
+                                        .await?;
+                                }
+                                continue; // Skip to next address
+                            } else if sent_to_others > 0 {
+                                // Has outputs to other addresses - this is an outgoing transaction
+                                info!(
                                 "Transaction {} (removed==added): Determined as OUTGOING from outputs - sent: {} sompi ({} KAS), received (change): {} sompi ({} KAS)",
                                 txid,
                                 sent_to_others,
@@ -574,28 +581,58 @@ impl TransactionProcessor {
                                 received_to_tracked,
                                 KaspaClient::sompi_to_kas(received_to_tracked)
                             );
-                            if self.config.notifications.outgoing_tx {
-                                let net_outgoing = removed_amount.saturating_sub(added_amount); // Should be 0, but use fee
-                                let net_change = if net_outgoing == 0 { 100_000 } else { net_outgoing }; // Fee estimate
-                                self.outgoing_handler
-                                    .handle_outgoing_tx(
-                                        &address,
-                                        chat_id,
-                                        txid.clone(),
-                                        sent_to_others, // Actual sent amount
-                                        net_change,
-                                        tx_daa_score,
-                                        virtual_daa_score,
-                                    )
-                                    .await?;
-                            }
-                            continue; // Skip to next address
-                        } else {
-                            // No outputs to others, all to tracked address - true self-transfer
-                            info!(
+                                if self.config.notifications.outgoing_tx {
+                                    let net_outgoing = removed_amount.saturating_sub(added_amount); // Should be 0, but use fee
+                                    let net_change = if net_outgoing == 0 {
+                                        100_000
+                                    } else {
+                                        net_outgoing
+                                    }; // Fee estimate
+                                    self.outgoing_handler
+                                        .handle_outgoing_tx(
+                                            &address,
+                                            chat_id,
+                                            txid.clone(),
+                                            sent_to_others, // Actual sent amount
+                                            net_change,
+                                            tx_daa_score,
+                                            virtual_daa_score,
+                                        )
+                                        .await?;
+                                }
+                                continue; // Skip to next address
+                            } else {
+                                // No outputs to others, all to tracked address - true self-transfer
+                                info!(
                                 "Transaction {} (removed==added): True self-transfer - all outputs to tracked address ({} sompi). Skipping.",
                                 txid, received_to_tracked
                             );
+                                let mut notified = self.notified_transactions.lock().await;
+                                notified.insert(txid.clone());
+                                drop(notified);
+                                let mut times = self.notified_transactions_times.lock().await;
+                                times.insert(txid, Instant::now());
+                                continue;
+                            }
+                        }
+                        Ok(None) => {
+                            // Cannot get transaction details - skip to avoid incorrect classification
+                            warn!(
+                            "Transaction {} (removed==added): Cannot get transaction details. Cannot determine if incoming or outgoing. Skipping to avoid incorrect classification.",
+                            txid
+                        );
+                            let mut notified = self.notified_transactions.lock().await;
+                            notified.insert(txid.clone());
+                            drop(notified);
+                            let mut times = self.notified_transactions_times.lock().await;
+                            times.insert(txid, Instant::now());
+                            continue;
+                        }
+                        Err(e) => {
+                            warn!(
+                            "Transaction {} (removed==added): Failed to get transaction details: {}. Cannot determine if incoming or outgoing. Skipping.",
+                            txid, e
+                        );
                             let mut notified = self.notified_transactions.lock().await;
                             notified.insert(txid.clone());
                             drop(notified);
@@ -604,33 +641,7 @@ impl TransactionProcessor {
                             continue;
                         }
                     }
-                    Ok(None) => {
-                        // Cannot get transaction details - skip to avoid incorrect classification
-                        warn!(
-                            "Transaction {} (removed==added): Cannot get transaction details. Cannot determine if incoming or outgoing. Skipping to avoid incorrect classification.",
-                            txid
-                        );
-                        let mut notified = self.notified_transactions.lock().await;
-                        notified.insert(txid.clone());
-                        drop(notified);
-                        let mut times = self.notified_transactions_times.lock().await;
-                        times.insert(txid, Instant::now());
-                        continue;
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Transaction {} (removed==added): Failed to get transaction details: {}. Cannot determine if incoming or outgoing. Skipping.",
-                            txid, e
-                        );
-                        let mut notified = self.notified_transactions.lock().await;
-                        notified.insert(txid.clone());
-                        drop(notified);
-                        let mut times = self.notified_transactions_times.lock().await;
-                        times.insert(txid, Instant::now());
-                        continue;
-                    }
                 }
-            }
                 NetDirection::ZeroZero => {
                     // removed_amount == 0 && added_amount == 0 - shouldn't happen, but skip if it does
                     warn!(
@@ -713,7 +724,7 @@ impl TransactionProcessor {
                     "OUTGOING TX {} for {}: removed={} sompi, added={} sompi, net_outgoing={} sompi",
                     txid, address, removed_amount, added_amount, net_outgoing
                 );
-                
+
                 if self.config.notifications.outgoing_tx {
                     // Calculate sent amount from transaction outputs if available
                     // IMPORTANT: Sum outputs NOT to the tracked address (these are the actual sent amounts)
@@ -770,8 +781,8 @@ impl TransactionProcessor {
                     let sent_amount_for_display = actual_sent_amount.unwrap_or(net_outgoing);
                     info!(
                         "Calling handle_outgoing_tx for txid {}: sent_amount={} sompi ({} KAS), net_change={} sompi ({} KAS), chat_id={}",
-                        txid, 
-                        sent_amount_for_display, 
+                        txid,
+                        sent_amount_for_display,
                         KaspaClient::sompi_to_kas(sent_amount_for_display),
                         net_outgoing,
                         KaspaClient::sompi_to_kas(net_outgoing),
@@ -800,8 +811,8 @@ impl TransactionProcessor {
                 } else {
                     warn!(
                         "Skipping outgoing transaction {}: notifications enabled={}, net_outgoing={} sompi ({} KAS)",
-                        txid, 
-                        self.config.notifications.outgoing_tx, 
+                        txid,
+                        self.config.notifications.outgoing_tx,
                         net_outgoing,
                         KaspaClient::sompi_to_kas(net_outgoing)
                     );

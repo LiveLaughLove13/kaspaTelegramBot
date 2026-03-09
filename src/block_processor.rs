@@ -100,7 +100,7 @@ impl BlockProcessor {
             // Store transaction in cache so we can look it up later when processing UtxosChanged
             self.kaspa_client.store_transaction_from_block(tx).await;
         }
-        
+
         // Find coinbase transaction and store block rewards as pending
         for tx in &block.transactions {
             if tx.subnetwork_id == SUBNETWORK_ID_COINBASE {
@@ -400,7 +400,10 @@ impl BlockProcessor {
         };
 
         let mut notify_balance_commit: Option<u64> = None;
-        let (previous_balance, new_balance) = if self.config.confirmation.strict_balance_reconciliation
+        let (previous_balance, new_balance) = if self
+            .config
+            .confirmation
+            .strict_balance_reconciliation
         {
             // Keep a dedicated reward baseline that only advances when we actually notify.
             // This avoids duplicate confirmations caused by periodic refresh cache drift.
@@ -473,10 +476,10 @@ impl BlockProcessor {
             .await;
 
         if let Err(e) = notify_result {
-                error!(
-                    "Failed to send Telegram notification to chat {}: {}",
-                    chat_id, e
-                );
+            error!(
+                "Failed to send Telegram notification to chat {}: {}",
+                chat_id, e
+            );
             // Keep pending so we can retry later.
             return Ok(());
         }

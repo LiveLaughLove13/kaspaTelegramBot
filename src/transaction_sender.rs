@@ -8,12 +8,14 @@ use kaspa_consensus_core::{
     sign,
     subnets::SUBNETWORK_ID_NATIVE,
     tx::{
-        PopulatedTransaction, Transaction, TransactionInput, TransactionOutpoint, TransactionOutput,
-        UtxoEntry,
+        PopulatedTransaction, Transaction, TransactionInput, TransactionOutpoint,
+        TransactionOutput, UtxoEntry,
     },
 };
 use kaspa_grpc_client::GrpcClient;
-use kaspa_rpc_core::{api::rpc::RpcApi, notify::mode::NotificationMode, GetUtxosByAddressesRequest};
+use kaspa_rpc_core::{
+    api::rpc::RpcApi, notify::mode::NotificationMode, GetUtxosByAddressesRequest,
+};
 use secp256k1::Keypair;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -73,7 +75,8 @@ impl TransactionSender {
         } else {
             config.node_address.trim().to_string()
         };
-        let chat_private_keys = parse_chat_private_keys_map(&config.preconfigured_chat_private_keys);
+        let chat_private_keys =
+            parse_chat_private_keys_map(&config.preconfigured_chat_private_keys);
 
         Self {
             enabled,
@@ -97,7 +100,9 @@ impl TransactionSender {
         match self.mode {
             WalletMode::Watchonly => false,
             WalletMode::External => self.signer_url.is_some(),
-            WalletMode::Local => self.allow_user_credentials || !self.chat_private_keys.lock().await.is_empty(),
+            WalletMode::Local => {
+                self.allow_user_credentials || !self.chat_private_keys.lock().await.is_empty()
+            }
         }
     }
 
@@ -114,12 +119,19 @@ impl TransactionSender {
             anyhow::bail!("User wallet credential commands are disabled by operator");
         }
         let normalized = normalize_private_key_hex(private_key_hex)?;
-        self.chat_private_keys.lock().await.insert(chat_id, normalized);
+        self.chat_private_keys
+            .lock()
+            .await
+            .insert(chat_id, normalized);
         Ok(())
     }
 
     pub async fn clear_user_private_key(&self, chat_id: i64) -> bool {
-        self.chat_private_keys.lock().await.remove(&chat_id).is_some()
+        self.chat_private_keys
+            .lock()
+            .await
+            .remove(&chat_id)
+            .is_some()
     }
 
     pub async fn has_user_private_key(&self, chat_id: i64) -> bool {
@@ -196,10 +208,9 @@ impl TransactionSender {
             .context("Failed to read node DAG info")?;
         let prefix: Prefix = dag.network.into();
 
-        let from_addr = Address::try_from(req.from_address.as_str())
-            .context("Invalid from address")?;
-        let to_addr = Address::try_from(req.to_address.as_str())
-            .context("Invalid to address")?;
+        let from_addr =
+            Address::try_from(req.from_address.as_str()).context("Invalid from address")?;
+        let to_addr = Address::try_from(req.to_address.as_str()).context("Invalid to address")?;
         if from_addr.prefix != prefix || to_addr.prefix != prefix {
             anyhow::bail!("Address network prefix does not match connected node network");
         }
@@ -209,9 +220,10 @@ impl TransactionSender {
             anyhow::bail!("Configured signing key does not match source address");
         }
 
-        let (inputs, total_input_sompi) = pick_inputs_for_amount(&client, &from_addr, req.amount_sompi)
-            .await
-            .context("Failed selecting spendable UTXOs")?;
+        let (inputs, total_input_sompi) =
+            pick_inputs_for_amount(&client, &from_addr, req.amount_sompi)
+                .await
+                .context("Failed selecting spendable UTXOs")?;
 
         let params = Params::from(dag.network);
         let mass_calc = MassCalculator::new(
@@ -333,7 +345,8 @@ impl TransactionSender {
                 .cloned()
                 .context("No private key configured for this chat_id")?
         };
-        let key_bytes = hex::decode(&private_key_hex).context("Invalid private key hex encoding")?;
+        let key_bytes =
+            hex::decode(&private_key_hex).context("Invalid private key hex encoding")?;
         if key_bytes.len() != 32 {
             anyhow::bail!("Private key must be 32 bytes");
         }
@@ -347,7 +360,11 @@ fn address_from_keypair(prefix: Prefix, keypair: &Keypair) -> Address {
     Address::new(prefix, Version::PubKey, &xonly_pk.serialize())
 }
 
-type SelectedInput = (TransactionOutpoint, u64, kaspa_consensus_core::tx::ScriptPublicKey);
+type SelectedInput = (
+    TransactionOutpoint,
+    u64,
+    kaspa_consensus_core::tx::ScriptPublicKey,
+);
 
 async fn pick_inputs_for_amount(
     client: &GrpcClient,
@@ -355,7 +372,10 @@ async fn pick_inputs_for_amount(
     amount_sompi: u64,
 ) -> Result<(Vec<SelectedInput>, u64)> {
     let mut utxos = client
-        .get_utxos_by_addresses_call(None, GetUtxosByAddressesRequest::new(vec![from_addr.clone()]))
+        .get_utxos_by_addresses_call(
+            None,
+            GetUtxosByAddressesRequest::new(vec![from_addr.clone()]),
+        )
         .await
         .context("get_utxos_by_addresses failed (node likely missing --utxoindex)")?
         .entries;
@@ -430,7 +450,14 @@ fn estimate_fee_and_change(
         );
         tx.finalize();
         let entries: Vec<UtxoEntry> = (0..input_count)
-            .map(|_| UtxoEntry::new(input_amount / input_count as u64, input_spk.clone(), UNACCEPTED_DAA_SCORE, false))
+            .map(|_| {
+                UtxoEntry::new(
+                    input_amount / input_count as u64,
+                    input_spk.clone(),
+                    UNACCEPTED_DAA_SCORE,
+                    false,
+                )
+            })
             .collect();
         let populated = PopulatedTransaction::new(&tx, entries);
 
@@ -541,7 +568,9 @@ pub fn parse_kas_to_sompi(input: &str) -> Result<u64> {
     let whole_sompi = whole
         .checked_mul(SOMPI_PER_KAS)
         .context("Amount is too large")?;
-    let total = whole_sompi.checked_add(frac).context("Amount is too large")?;
+    let total = whole_sompi
+        .checked_add(frac)
+        .context("Amount is too large")?;
 
     if total == 0 {
         anyhow::bail!("Amount must be greater than zero");
@@ -579,8 +608,14 @@ mod tests {
     #[test]
     fn parses_chat_key_map() {
         let mut raw = HashMap::new();
-        raw.insert("123".to_string(), "0000000000000000000000000000000000000000000000000000000000000001".to_string());
-        raw.insert("-99".to_string(), "0x0000000000000000000000000000000000000000000000000000000000000002".to_string());
+        raw.insert(
+            "123".to_string(),
+            "0000000000000000000000000000000000000000000000000000000000000001".to_string(),
+        );
+        raw.insert(
+            "-99".to_string(),
+            "0x0000000000000000000000000000000000000000000000000000000000000002".to_string(),
+        );
         let keys = parse_chat_private_keys_map(&raw);
         assert_eq!(
             keys.get(&123).map(String::as_str),
@@ -595,7 +630,10 @@ mod tests {
     #[test]
     fn validates_private_key_hex() {
         assert!(normalize_private_key_hex("01").is_err());
-        assert!(normalize_private_key_hex("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz").is_err());
+        assert!(normalize_private_key_hex(
+            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"
+        )
+        .is_err());
         assert_eq!(
             normalize_private_key_hex(
                 "0x0000000000000000000000000000000000000000000000000000000000000003"

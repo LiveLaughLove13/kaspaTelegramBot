@@ -16,6 +16,18 @@ use tracing::{debug, info, warn};
 
 const KAS_TO_SOMPI: f64 = 100_000_000.0;
 
+fn normalize_grpc_address(node_address: &str) -> String {
+    if node_address.starts_with("grpc://") {
+        node_address.to_string()
+    } else {
+        format!("grpc://{}", node_address)
+    }
+}
+
+fn is_mempool_not_found_error(err: &str) -> bool {
+    err.to_lowercase().contains("not found")
+}
+
 pub struct KaspaClient {
     client: Arc<GrpcClient>,
     notification_rx: Arc<Mutex<Option<mpsc::UnboundedReceiver<Notification>>>>,
@@ -32,11 +44,7 @@ impl KaspaClient {
     pub async fn new(node_address: String) -> Result<Self> {
         info!("Connecting to Kaspa node at {}", node_address);
 
-        let grpc_address = if node_address.starts_with("grpc://") {
-            node_address.clone()
-        } else {
-            format!("grpc://{}", node_address)
-        };
+        let grpc_address = normalize_grpc_address(&node_address);
 
         let mut attempt = 0u64;
         let mut backoff_ms = 250u64;
@@ -283,7 +291,7 @@ impl KaspaClient {
                 Ok(response) => return Ok(Some(response.mempool_entry)),
                 Err(e) => {
                     // Check if error is "transaction not found" (expected for confirmed transactions)
-                    let is_not_found = e.to_string().to_lowercase().contains("not found");
+                    let is_not_found = is_mempool_not_found_error(&e.to_string());
 
                     // If the node says it's not found in the mempool, treat it as confirmed and
                     // return immediately. Retrying here just adds latency to notifications.
@@ -518,13 +526,16 @@ impl KaspaClient {
         let mut attempt = 0;
         let max_attempts = 3;
         let mut backoff_ms = 100;
-        
+
         loop {
             attempt += 1;
             match self.get_mempool_entry(txid).await {
                 Ok(Some(mempool_entry)) => {
                     // Transaction found in mempool - calculate from outputs
-                    return self.calculate_sent_amount_from_tx(&mempool_entry.transaction, tracked_address);
+                    return self.calculate_sent_amount_from_tx(
+                        &mempool_entry.transaction,
+                        tracked_address,
+                    );
                 }
                 Ok(None) if attempt < max_attempts => {
                     // Transaction not in mempool - might be very recently confirmed, retry once
@@ -541,26 +552,23 @@ impl KaspaClient {
                     break;
                 }
                 Err(e) => {
-                    warn!(
-                        "Failed to get mempool entry for {}: {}",
-                        txid, e
-                    );
+                    warn!("Failed to get mempool entry for {}: {}", txid, e);
                     // Try block cache as fallback
                     break;
                 }
             }
         }
-        
+
         // Try to get from block cache
         let cache = self.recent_transactions.lock().await;
         if let Some(tx) = cache.get(txid) {
             info!("Found transaction {} in block cache", txid);
             return self.calculate_sent_amount_from_tx(tx, tracked_address);
         }
-        
+
         Ok(None)
     }
-    
+
     // Calculate amounts from transaction outputs
     // Returns: (sent_amount, received_amount) where:
     // - sent_amount: sum of outputs NOT to the tracked address
@@ -572,7 +580,7 @@ impl KaspaClient {
     ) -> Result<Option<(u64, u64)>> {
         let mut sent_amount: u64 = 0;
         let mut received_amount: u64 = 0;
-        
+
         for output in &tx.outputs {
             if let Some(verbose_data) = &output.verbose_data {
                 let output_address = verbose_data.script_public_key_address.to_string();
@@ -585,7 +593,7 @@ impl KaspaClient {
                 }
             }
         }
-        
+
         if sent_amount > 0 || received_amount > 0 {
             Ok(Some((sent_amount, received_amount)))
         } else {
@@ -614,5 +622,33 @@ impl KaspaClient {
             }
         }
     }
+}
 
+#[cfg(test)]
+mod tests {
+    use super::{is_mempool_not_found_error, normalize_grpc_address, KAS_TO_SOMPI};
+
+    #[test]
+    fn normalizes_grpc_addresses() {
+        assert_eq!(
+            normalize_grpc_address("127.0.0.1:16110"),
+            "grpc://127.0.0.1:16110"
+        );
+        assert_eq!(
+            normalize_grpc_address("grpc://10.0.0.2:16110"),
+            "grpc://10.0.0.2:16110"
+        );
+    }
+
+    #[test]
+    fn detects_mempool_not_found_errors_case_insensitive() {
+        assert!(is_mempool_not_found_error("Transaction not found"));
+        assert!(is_mempool_not_found_error("NOT FOUND in mempool"));
+        assert!(!is_mempool_not_found_error("rpc timeout"));
+    }
+
+    #[test]
+    fn kas_to_sompi_constant_is_expected() {
+        assert_eq!(KAS_TO_SOMPI, 100_000_000.0);
+    }
 }
