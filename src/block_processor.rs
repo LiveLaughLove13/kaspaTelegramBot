@@ -122,8 +122,9 @@ impl BlockProcessor {
                     if let Some(verbose_data) = &output.verbose_data {
                         let address = &verbose_data.script_public_key_address;
                         let addr_str = address.to_string();
-                        // Get the user who owns this address
-                        if let Some(chat_id) = self.kaspa_client.get_address_owner(&addr_str) {
+                        // Get all users tracking this address
+                        let owners = self.kaspa_client.get_address_owners(&addr_str);
+                        for chat_id in owners {
                             // This is a block reward to a tracked address
                             let reward = output.value;
 
@@ -143,7 +144,7 @@ impl BlockProcessor {
                                         block_hash: block_hash.clone(),
                                         coinbase_txid: coinbase_txid.clone(),
                                         output_index: output_index as u32,
-                                        address: addr_str,
+                                        address: addr_str.clone(),
                                         chat_id,
                                         reward,
                                         daa_score: block_daa_score,

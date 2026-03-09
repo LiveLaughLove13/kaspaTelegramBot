@@ -21,8 +21,8 @@ pub struct KaspaClient {
     notification_rx: Arc<Mutex<Option<mpsc::UnboundedReceiver<Notification>>>>,
     // Maps user chat_id to their tracked addresses
     user_addresses: Arc<parking_lot::Mutex<HashMap<i64, HashSet<String>>>>,
-    // Maps address to user chat_id for quick lookup
-    address_to_user: Arc<parking_lot::Mutex<HashMap<String, i64>>>,
+    // Maps address to subscribed chat_ids for quick fan-out lookup
+    address_to_users: Arc<parking_lot::Mutex<HashMap<String, HashSet<i64>>>>,
     // Cache of recent transactions from blocks (txid -> transaction data)
     // This allows us to look up transaction details even after they're confirmed
     recent_transactions: Arc<tokio::sync::Mutex<HashMap<String, kaspa_rpc_core::RpcTransaction>>>,
@@ -147,7 +147,7 @@ impl KaspaClient {
             client,
             notification_rx: Arc::new(Mutex::new(Some(rx))),
             user_addresses: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-            address_to_user: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            address_to_users: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             recent_transactions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         })
     }
@@ -155,39 +155,40 @@ impl KaspaClient {
     // Add an address to track for a specific user
     pub fn add_tracked_address(&self, chat_id: i64, address: String) {
         let mut user_addrs = self.user_addresses.lock();
-        let mut addr_to_user = self.address_to_user.lock();
+        let mut addr_to_users = self.address_to_users.lock();
 
         user_addrs
             .entry(chat_id)
             .or_default()
             .insert(address.clone());
-        addr_to_user.insert(address, chat_id);
+        addr_to_users.entry(address).or_default().insert(chat_id);
     }
 
     // Remove an address from tracking for a specific user
     pub fn remove_tracked_address(&self, chat_id: i64, address: &str) -> bool {
         let mut user_addrs = self.user_addresses.lock();
-        let mut addr_to_user = self.address_to_user.lock();
-
-        // Check if this address belongs to this user
-        if let Some(&owner_chat_id) = addr_to_user.get(address) {
-            if owner_chat_id != chat_id {
-                return false; // Address belongs to a different user
-            }
-        } else {
-            return false; // Address not tracked
-        }
+        let mut addr_to_users = self.address_to_users.lock();
 
         // Remove from user's address set
         if let Some(addrs) = user_addrs.get_mut(&chat_id) {
-            addrs.remove(address);
+            if !addrs.remove(address) {
+                return false;
+            }
             if addrs.is_empty() {
                 user_addrs.remove(&chat_id);
             }
+        } else {
+            return false;
         }
 
-        // Remove from address-to-user mapping
-        addr_to_user.remove(address);
+        // Remove this user from address subscriber set
+        if let Some(subscribers) = addr_to_users.get_mut(address) {
+            subscribers.remove(&chat_id);
+            if subscribers.is_empty() {
+                addr_to_users.remove(address);
+            }
+        }
+
         true
     }
 
@@ -202,12 +203,19 @@ impl KaspaClient {
 
     // Get all tracked addresses (across all users) - for notification processing
     pub fn get_all_tracked_addresses(&self) -> Vec<String> {
-        self.address_to_user.lock().keys().cloned().collect()
+        self.address_to_users.lock().keys().cloned().collect()
     }
 
-    // Get the user (chat_id) who owns a specific address
-    pub fn get_address_owner(&self, address: &str) -> Option<i64> {
-        self.address_to_user.lock().get(address).copied()
+    // Get all subscribers (chat_ids) for a specific address
+    pub fn get_address_owners(&self, address: &str) -> Vec<i64> {
+        let mut owners: Vec<i64> = self
+            .address_to_users
+            .lock()
+            .get(address)
+            .map(|ids| ids.iter().copied().collect())
+            .unwrap_or_default();
+        owners.sort_unstable();
+        owners
     }
 
     pub async fn take_notification_receiver(

@@ -96,8 +96,8 @@ impl TransactionProcessor {
         // All UTXOs in a UtxosChanged notification are from the same transaction.
         // The transaction ID is in added.outpoint.transaction_id (the transaction that created the new UTXOs).
         // Group by address to calculate net amounts (removed - change returned)
-        type AddressData = (i64, u64, u64, u64, String); // (chat_id, removed_amount, added_amount, earliest_daa_score, txid)
-        let mut address_data: HashMap<String, AddressData> = HashMap::new();
+        type AddressData = (String, i64, u64, u64, u64, String); // (address, chat_id, removed_amount, added_amount, earliest_daa_score, txid)
+        let mut address_data: HashMap<(String, i64), AddressData> = HashMap::new();
 
         debug!(
             "Processing UtxosChanged: {} removed UTXOs, {} added UTXOs",
@@ -139,7 +139,8 @@ impl TransactionProcessor {
         for removed in utxos_changed.removed.iter() {
             if let Some(address) = &removed.address {
                 let addr_str = address.to_string();
-                if let Some(chat_id) = self.kaspa_client.get_address_owner(&addr_str) {
+                let owners = self.kaspa_client.get_address_owners(&addr_str);
+                for chat_id in owners {
                     // Use txid from added if available, otherwise we can't process this properly
                     let txid = current_txid.clone().unwrap_or_else(|| {
                         // If no added UTXOs, this is a pure outgoing transaction
@@ -147,13 +148,21 @@ impl TransactionProcessor {
                         "unknown".to_string()
                     });
 
-                    let entry = address_data.entry(addr_str.clone()).or_insert_with(|| {
-                        (chat_id, 0, 0, removed.utxo_entry.block_daa_score, txid)
+                    let key = (addr_str.clone(), chat_id);
+                    let entry = address_data.entry(key).or_insert_with(|| {
+                        (
+                            addr_str.clone(),
+                            chat_id,
+                            0,
+                            0,
+                            removed.utxo_entry.block_daa_score,
+                            txid,
+                        )
                     });
-                    entry.1 += removed.utxo_entry.amount; // Sum removed amounts
+                    entry.2 += removed.utxo_entry.amount; // Sum removed amounts
                                                           // Use the earliest (lowest) DAA score
-                    if removed.utxo_entry.block_daa_score < entry.3 {
-                        entry.3 = removed.utxo_entry.block_daa_score;
+                    if removed.utxo_entry.block_daa_score < entry.4 {
+                        entry.4 = removed.utxo_entry.block_daa_score;
                     }
                 }
             }
@@ -206,10 +215,13 @@ impl TransactionProcessor {
         for added in utxos_changed.added.iter() {
             if let Some(address) = &added.address {
                 let addr_str = address.to_string();
-                if let Some(chat_id) = self.kaspa_client.get_address_owner(&addr_str) {
+                let owners = self.kaspa_client.get_address_owners(&addr_str);
+                for chat_id in owners {
                     let txid = added.outpoint.transaction_id.to_string();
-                    let entry = address_data.entry(addr_str.clone()).or_insert_with(|| {
+                    let key = (addr_str.clone(), chat_id);
+                    let entry = address_data.entry(key).or_insert_with(|| {
                         (
+                            addr_str.clone(),
                             chat_id,
                             0,
                             0,
@@ -217,13 +229,13 @@ impl TransactionProcessor {
                             txid.clone(),
                         )
                     });
-                    entry.2 += added.utxo_entry.amount; // Sum added amounts
+                    entry.3 += added.utxo_entry.amount; // Sum added amounts
                                                         // Use the earliest (lowest) DAA score
-                    if added.utxo_entry.block_daa_score < entry.3 {
-                        entry.3 = added.utxo_entry.block_daa_score;
+                    if added.utxo_entry.block_daa_score < entry.4 {
+                        entry.4 = added.utxo_entry.block_daa_score;
                     }
                     // Ensure txid is set (this is the actual transaction ID)
-                    entry.4 = txid;
+                    entry.5 = txid;
                 }
             }
         }
@@ -233,7 +245,8 @@ impl TransactionProcessor {
             "Processing {} addresses from UtxosChanged notification",
             address_data.len()
         );
-        for (address, (chat_id, removed_amount, added_amount, tx_daa_score, txid)) in address_data {
+        for (_, (address, chat_id, removed_amount, added_amount, tx_daa_score, txid)) in address_data
+        {
             info!(
                 "Processing transaction for address {}: removed={} sompi ({} KAS), added={} sompi ({} KAS), txid={}, daa_score={}, chat_id={}",
                 address, 

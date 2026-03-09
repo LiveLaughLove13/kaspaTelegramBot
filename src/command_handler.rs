@@ -555,21 +555,6 @@ or simply:
             return Ok(());
         }
 
-        // Check if address is tracked by another user
-        if let Some(owner_chat_id) = self.kaspa_client.get_address_owner(&addr_str) {
-            if owner_chat_id != chat_id {
-                self.send_message(
-                    chat_id,
-                    &format!(
-                        "ℹ️ Address <code>{}</code> is already being tracked by another user.",
-                        addr_str
-                    ),
-                )
-                .await?;
-                return Ok(());
-            }
-        }
-
         // Add to tracking for this user
         self.kaspa_client
             .add_tracked_address(chat_id, addr_str.clone());
