@@ -9,6 +9,15 @@ use std::time::Instant;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
+fn should_store_incoming_pending(is_in_block: bool, daa_diff: u64, confirmation_depth: u64) -> bool {
+    !is_in_block && daa_diff < confirmation_depth
+}
+
+fn calculate_incoming_balances(current_balance: u64, received_amount: u64) -> (u64, u64) {
+    let previous_balance = current_balance.saturating_sub(received_amount);
+    (previous_balance, current_balance)
+}
+
 pub struct IncomingTransactionHandler {
     kaspa_client: Arc<KaspaClient>,
     telegram_client: Arc<TelegramClient>,
@@ -83,7 +92,7 @@ impl IncomingTransactionHandler {
 
         // If transaction is already in a block (confirmed), process immediately
         // Otherwise, wait for DAA depth confirmation
-        if !is_in_block && daa_diff < confirmation_depth {
+        if should_store_incoming_pending(is_in_block, daa_diff, confirmation_depth) {
             // Not yet confirmed, store as pending
             debug!(
                 "Transaction {} not yet confirmed (DAA diff: {} < {}, in_mempool: true)",
@@ -203,8 +212,8 @@ impl IncomingTransactionHandler {
 
         // Calculate previous balance: current balance already includes this incoming transaction
         // Use actual_received_amount instead of amount for more accuracy
-        let previous_balance = current_balance.saturating_sub(actual_received_amount);
-        let new_balance = current_balance;
+        let (previous_balance, new_balance) =
+            calculate_incoming_balances(current_balance, actual_received_amount);
 
         // Update cached balance with the fresh blockchain balance
         // This ensures the cache is always in sync with the blockchain
@@ -319,5 +328,32 @@ impl IncomingTransactionHandler {
                 times.remove(txid);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{calculate_incoming_balances, should_store_incoming_pending};
+
+    #[test]
+    fn incoming_pending_gate_respects_block_and_depth() {
+        assert!(should_store_incoming_pending(false, 2, 10));
+        assert!(!should_store_incoming_pending(true, 0, 10));
+        assert!(!should_store_incoming_pending(false, 10, 10));
+        assert!(!should_store_incoming_pending(false, 11, 10));
+    }
+
+    #[test]
+    fn incoming_balance_math_is_consistent() {
+        let (prev, new) = calculate_incoming_balances(1_000, 250);
+        assert_eq!(prev, 750);
+        assert_eq!(new, 1_000);
+    }
+
+    #[test]
+    fn incoming_balance_math_saturates_at_zero() {
+        let (prev, new) = calculate_incoming_balances(100, 500);
+        assert_eq!(prev, 0);
+        assert_eq!(new, 100);
     }
 }

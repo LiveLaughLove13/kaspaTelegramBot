@@ -15,6 +15,38 @@ use std::time::Instant;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
+const HISTORICAL_THRESHOLD: u64 = 10_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NetDirection {
+    PureIncoming,
+    PureOutgoing,
+    NetIncoming(u64),
+    NetOutgoing(u64),
+    EqualNonZero,
+    ZeroZero,
+}
+
+fn classify_net_direction(removed_amount: u64, added_amount: u64) -> NetDirection {
+    if removed_amount == 0 && added_amount > 0 {
+        NetDirection::PureIncoming
+    } else if removed_amount > 0 && added_amount == 0 {
+        NetDirection::PureOutgoing
+    } else if added_amount > removed_amount {
+        NetDirection::NetIncoming(added_amount - removed_amount)
+    } else if removed_amount > added_amount {
+        NetDirection::NetOutgoing(removed_amount - added_amount)
+    } else if removed_amount > 0 {
+        NetDirection::EqualNonZero
+    } else {
+        NetDirection::ZeroZero
+    }
+}
+
+fn is_historical_transaction(virtual_daa_score: u64, tx_daa_score: u64) -> bool {
+    virtual_daa_score.saturating_sub(tx_daa_score) > HISTORICAL_THRESHOLD
+}
+
 pub struct PendingTransaction {
     pub txid: String,
     pub address: String,
@@ -293,8 +325,7 @@ impl TransactionProcessor {
             // Skip historical transactions (only if they're very old - more than 10,000 DAA)
             // This prevents spam when an address is first added, but allows recent transactions
             let daa_diff = virtual_daa_score.saturating_sub(tx_daa_score);
-            const HISTORICAL_THRESHOLD: u64 = 10_000; // Increased from 1000 to 10,000 to avoid filtering recent transactions
-            if daa_diff > HISTORICAL_THRESHOLD {
+            if is_historical_transaction(virtual_daa_score, tx_daa_score) {
                 debug!(
                     "Skipping historical transaction {} for address {} (DAA diff: {} > {})",
                     txid, address, daa_diff, HISTORICAL_THRESHOLD
@@ -320,7 +351,8 @@ impl TransactionProcessor {
 
             // Check for pure incoming FIRST (no inputs from this address, only outputs to it)
             // This MUST be checked before outgoing to avoid misclassification
-            if removed_amount == 0 && added_amount > 0 {
+            match classify_net_direction(removed_amount, added_amount) {
+                NetDirection::PureIncoming => {
                 // Pure incoming transaction (no inputs from this address, only outputs to it)
                 info!(
                     "Processing PURE INCOMING transaction {} for address {}: removed={}, added={}",
@@ -344,7 +376,8 @@ impl TransactionProcessor {
                     );
                 }
                 continue; // IMPORTANT: Skip to next address to avoid processing as outgoing
-            } else if removed_amount > 0 && added_amount == 0 {
+            }
+                NetDirection::PureOutgoing => {
                 // Pure outgoing with no change
                 // For pure outgoing, removed_amount is both the sent amount and net change (no change returned)
                 debug!(
@@ -364,9 +397,9 @@ impl TransactionProcessor {
                         )
                         .await?;
                 }
-            } else if added_amount > removed_amount {
+            }
+                NetDirection::NetIncoming(net_incoming) => {
                 // Net incoming transaction (received more than spent)
-                let net_incoming = added_amount - removed_amount;
                 info!(
                     "Processing INCOMING transaction {} for address {}: removed={}, added={}, net={}",
                     txid, address, removed_amount, added_amount, net_incoming
@@ -389,10 +422,9 @@ impl TransactionProcessor {
                     );
                 }
                 continue; // IMPORTANT: Skip to next address to avoid processing as outgoing
-            } else if removed_amount > added_amount {
+            }
+                NetDirection::NetOutgoing(net_outgoing) => {
                 // Net outgoing transaction (spent more than received back as change)
-                let net_outgoing = removed_amount - added_amount;
-
                 info!(
                     "OUTGOING TX {} for {}: removed={} sompi, added={} sompi, net_outgoing={} sompi",
                     txid, address, removed_amount, added_amount, net_outgoing
@@ -494,7 +526,8 @@ impl TransactionProcessor {
                         KaspaClient::sompi_to_kas(net_outgoing)
                     );
                 }
-            } else if removed_amount > 0 && added_amount > 0 && removed_amount == added_amount {
+            }
+                NetDirection::EqualNonZero => {
                 // removed_amount == added_amount: Need to check transaction outputs to determine direction
                 // This could be:
                 // 1. Incoming transaction where sender also sent change back to themselves (rare but possible)
@@ -597,7 +630,17 @@ impl TransactionProcessor {
                         continue;
                     }
                 }
-            } else if removed_amount == 0 && added_amount > 0 {
+            }
+                NetDirection::ZeroZero => {
+                    // removed_amount == 0 && added_amount == 0 - shouldn't happen, but skip if it does
+                    warn!(
+                        "Transaction {} for address {} has both removed=0 and added=0 - skipping",
+                        txid, address
+                    );
+                }
+            }
+
+            /*} else if removed_amount == 0 && added_amount > 0 {
                 // This case should have been handled above, but adding as safety check
                 // Pure incoming transaction (no inputs from this address, only outputs to it)
                 info!(
@@ -775,7 +818,7 @@ impl TransactionProcessor {
                     "Transaction {} for address {} has both removed=0 and added=0 - skipping",
                     txid, address
                 );
-            }
+            }*/
         }
 
         Ok(())
@@ -878,6 +921,25 @@ impl TransactionProcessor {
 
 #[cfg(test)]
 mod tests {
+    use super::{classify_net_direction, is_historical_transaction, NetDirection};
+
+    #[test]
+    fn classifies_net_directions() {
+        assert_eq!(classify_net_direction(0, 5), NetDirection::PureIncoming);
+        assert_eq!(classify_net_direction(5, 0), NetDirection::PureOutgoing);
+        assert_eq!(classify_net_direction(3, 9), NetDirection::NetIncoming(6));
+        assert_eq!(classify_net_direction(9, 3), NetDirection::NetOutgoing(6));
+        assert_eq!(classify_net_direction(7, 7), NetDirection::EqualNonZero);
+        assert_eq!(classify_net_direction(0, 0), NetDirection::ZeroZero);
+    }
+
+    #[test]
+    fn historical_filter_threshold() {
+        assert!(is_historical_transaction(100_000, 89_999)); // 10,001
+        assert!(!is_historical_transaction(100_000, 90_000)); // 10,000
+        assert!(!is_historical_transaction(100_000, 99_999)); // 1
+    }
+
     #[tokio::test]
     async fn test_coinbase_transaction_filtering() {
         // This test verifies that coinbase transactions are properly filtered out

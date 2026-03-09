@@ -216,3 +216,171 @@ api_key = ""
         Ok(config)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{Config, WalletConfig, WalletMode};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn unique_temp_dir(prefix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("{}_{}", prefix, nanos))
+    }
+
+    #[test]
+    fn wallet_mode_default_is_watchonly() {
+        assert_eq!(WalletMode::default(), WalletMode::Watchonly);
+    }
+
+    #[test]
+    fn wallet_config_defaults_are_safe() {
+        let wallet = WalletConfig::default();
+        assert!(!wallet.send_enabled);
+        assert_eq!(wallet.mode, WalletMode::Watchonly);
+        assert!(wallet.node_address.is_empty());
+        assert!(wallet.allow_user_credentials);
+        assert!(wallet.preconfigured_chat_private_keys.is_empty());
+        assert!(wallet.signer.url.is_empty());
+        assert!(wallet.signer.api_key.is_empty());
+    }
+
+    #[test]
+    fn load_creates_default_config_when_missing() {
+        let _guard = test_lock().lock().expect("test lock poisoned");
+        let prev_dir = std::env::current_dir().expect("read cwd");
+        let prev_token = std::env::var("TELEGRAM_BOT_TOKEN").ok();
+        std::env::remove_var("TELEGRAM_BOT_TOKEN");
+
+        let dir = unique_temp_dir("kaspa_bot_config_missing");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        std::env::set_current_dir(&dir).expect("set cwd");
+
+        let result = Config::load();
+        assert!(result.is_err());
+        let err = format!("{}", result.expect_err("expected missing-config error"));
+        assert!(err.contains("Created default config at bot-config.toml"));
+        assert!(dir.join("bot-config.toml").exists());
+
+        std::env::set_current_dir(prev_dir).expect("restore cwd");
+        if let Some(token) = prev_token {
+            std::env::set_var("TELEGRAM_BOT_TOKEN", token);
+        }
+    }
+
+    #[test]
+    fn load_applies_env_token_and_wallet_node_fallback() {
+        let _guard = test_lock().lock().expect("test lock poisoned");
+        let prev_dir = std::env::current_dir().expect("read cwd");
+        let prev_token = std::env::var("TELEGRAM_BOT_TOKEN").ok();
+
+        let dir = unique_temp_dir("kaspa_bot_config_fallback");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        std::env::set_current_dir(&dir).expect("set cwd");
+
+        let cfg = r#"
+[kaspa]
+node_address = "127.0.0.1:16110"
+
+[telegram]
+bot_token = "file-token"
+chat_id = ""
+
+[notifications]
+incoming_tx = true
+outgoing_tx = true
+block_rewards = true
+blue_blocks_only = true
+
+[confirmation]
+daa_score_depth = 10
+strict_balance_reconciliation = true
+
+[wallet]
+send_enabled = false
+mode = "watchonly"
+node_address = ""
+allow_user_credentials = true
+preconfigured_chat_private_keys = {}
+
+[wallet.signer]
+url = ""
+api_key = ""
+"#;
+        fs::write("bot-config.toml", cfg).expect("write config");
+        std::env::set_var("TELEGRAM_BOT_TOKEN", "env-token");
+
+        let loaded = Config::load().expect("load config");
+        assert_eq!(loaded.telegram.bot_token, "env-token");
+        assert_eq!(loaded.wallet.node_address, loaded.kaspa.node_address);
+
+        std::env::set_current_dir(prev_dir).expect("restore cwd");
+        if let Some(token) = prev_token {
+            std::env::set_var("TELEGRAM_BOT_TOKEN", token);
+        } else {
+            std::env::remove_var("TELEGRAM_BOT_TOKEN");
+        }
+    }
+
+    #[test]
+    fn load_keeps_explicit_wallet_node_address() {
+        let _guard = test_lock().lock().expect("test lock poisoned");
+        let prev_dir = std::env::current_dir().expect("read cwd");
+        let prev_token = std::env::var("TELEGRAM_BOT_TOKEN").ok();
+        std::env::remove_var("TELEGRAM_BOT_TOKEN");
+
+        let dir = unique_temp_dir("kaspa_bot_config_explicit_wallet_node");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        std::env::set_current_dir(&dir).expect("set cwd");
+
+        let cfg = r#"
+[kaspa]
+node_address = "127.0.0.1:16110"
+
+[telegram]
+bot_token = "file-token"
+chat_id = ""
+
+[notifications]
+incoming_tx = true
+outgoing_tx = true
+block_rewards = true
+blue_blocks_only = true
+
+[confirmation]
+daa_score_depth = 10
+strict_balance_reconciliation = true
+
+[wallet]
+send_enabled = true
+mode = "local"
+node_address = "127.0.0.1:26210"
+allow_user_credentials = true
+preconfigured_chat_private_keys = {}
+
+[wallet.signer]
+url = ""
+api_key = ""
+"#;
+        fs::write("bot-config.toml", cfg).expect("write config");
+
+        let loaded = Config::load().expect("load config");
+        assert_eq!(loaded.wallet.node_address, "127.0.0.1:26210");
+        assert_eq!(loaded.kaspa.node_address, "127.0.0.1:16110");
+
+        std::env::set_current_dir(prev_dir).expect("restore cwd");
+        if let Some(token) = prev_token {
+            std::env::set_var("TELEGRAM_BOT_TOKEN", token);
+        }
+    }
+}

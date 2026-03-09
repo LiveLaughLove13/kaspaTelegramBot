@@ -623,7 +623,7 @@ impl BlockProcessor {
 
 #[cfg(test)]
 mod tests {
-    use super::BlockRewardRecord;
+    use super::{BlockProcessor, BlockRewardRecord};
 
     #[tokio::test]
     async fn test_blue_block_filtering() {
@@ -719,5 +719,16 @@ mod tests {
             new_balance, current_balance,
             "New balance should equal current balance"
         );
+    }
+
+    #[test]
+    fn reward_balance_key_is_unique_per_chat_and_address() {
+        let a = BlockProcessor::reward_balance_key(100, "kaspa:qa");
+        let b = BlockProcessor::reward_balance_key(101, "kaspa:qa");
+        let c = BlockProcessor::reward_balance_key(100, "kaspa:qb");
+
+        assert_ne!(a, b);
+        assert_ne!(a, c);
+        assert_eq!(a, "100:kaspa:qa");
     }
 }

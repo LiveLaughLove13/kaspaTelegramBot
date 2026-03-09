@@ -560,6 +560,9 @@ mod tests {
         assert_eq!(parse_kas_to_sompi("1.23").unwrap(), 123_000_000);
         assert_eq!(parse_kas_to_sompi("0.00000001").unwrap(), 1);
         assert_eq!(parse_kas_to_sompi("2").unwrap(), 200_000_000);
+        assert_eq!(parse_kas_to_sompi("1.").unwrap(), 100_000_000);
+        assert_eq!(parse_kas_to_sompi(".5").unwrap(), 50_000_000);
+        assert_eq!(parse_kas_to_sompi(" 0.10000000 ").unwrap(), 10_000_000);
     }
 
     #[test]
@@ -568,6 +571,9 @@ mod tests {
         assert!(parse_kas_to_sompi("-1").is_err());
         assert!(parse_kas_to_sompi("1.000000001").is_err());
         assert!(parse_kas_to_sompi("abc").is_err());
+        assert!(parse_kas_to_sompi("").is_err());
+        assert!(parse_kas_to_sompi("1.2.3").is_err());
+        assert!(parse_kas_to_sompi("+1").is_err());
     }
 
     #[test]
@@ -590,5 +596,24 @@ mod tests {
     fn validates_private_key_hex() {
         assert!(normalize_private_key_hex("01").is_err());
         assert!(normalize_private_key_hex("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz").is_err());
+        assert_eq!(
+            normalize_private_key_hex(
+                "0x0000000000000000000000000000000000000000000000000000000000000003"
+            )
+            .unwrap(),
+            "0000000000000000000000000000000000000000000000000000000000000003"
+        );
+    }
+
+    #[test]
+    fn parse_chat_key_map_skips_invalid_entries() {
+        let mut raw = HashMap::new();
+        raw.insert("not-a-chat-id".to_string(), "00".to_string());
+        raw.insert(
+            "42".to_string(),
+            "invalid-private-key-value-that-is-not-hex".to_string(),
+        );
+        let keys = parse_chat_private_keys_map(&raw);
+        assert!(keys.is_empty());
     }
 }

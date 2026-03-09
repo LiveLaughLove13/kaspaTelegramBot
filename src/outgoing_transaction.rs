@@ -9,6 +9,15 @@ use std::time::Instant;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
+fn should_store_outgoing_pending(is_in_block: bool, daa_diff: u64, confirmation_depth: u64) -> bool {
+    !is_in_block && daa_diff < confirmation_depth
+}
+
+fn calculate_outgoing_balances(current_balance: u64, net_change: u64) -> (u64, u64) {
+    let previous_balance = current_balance.saturating_add(net_change);
+    (previous_balance, current_balance)
+}
+
 pub struct OutgoingTransactionHandler {
     kaspa_client: Arc<KaspaClient>,
     telegram_client: Arc<TelegramClient>,
@@ -88,7 +97,7 @@ impl OutgoingTransactionHandler {
 
         // If transaction is already in a block (confirmed), process immediately
         // Otherwise, wait for DAA depth confirmation
-        if !is_in_block && daa_diff < confirmation_depth {
+        if should_store_outgoing_pending(is_in_block, daa_diff, confirmation_depth) {
             // Not yet confirmed, store as pending
             info!(
                 "Outgoing transaction {} stored as pending (DAA diff: {} < {}, in_mempool: true, will be processed when confirmed)",
@@ -234,8 +243,8 @@ impl OutgoingTransactionHandler {
             );
         }
         
-        let previous_balance = current_balance.saturating_add(net_change);
-        let new_balance = current_balance;
+        let (previous_balance, new_balance) =
+            calculate_outgoing_balances(current_balance, net_change);
         
         // Validate balance calculation makes sense
         if previous_balance < new_balance {
@@ -375,5 +384,32 @@ impl OutgoingTransactionHandler {
                 times.remove(txid);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{calculate_outgoing_balances, should_store_outgoing_pending};
+
+    #[test]
+    fn outgoing_pending_gate_respects_block_and_depth() {
+        assert!(should_store_outgoing_pending(false, 2, 10));
+        assert!(!should_store_outgoing_pending(true, 0, 10));
+        assert!(!should_store_outgoing_pending(false, 10, 10));
+        assert!(!should_store_outgoing_pending(false, 11, 10));
+    }
+
+    #[test]
+    fn outgoing_balance_math_is_consistent() {
+        let (prev, new) = calculate_outgoing_balances(1_000, 250);
+        assert_eq!(prev, 1_250);
+        assert_eq!(new, 1_000);
+    }
+
+    #[test]
+    fn outgoing_balance_math_handles_zero_change() {
+        let (prev, new) = calculate_outgoing_balances(1_000, 0);
+        assert_eq!(prev, 1_000);
+        assert_eq!(new, 1_000);
     }
 }
