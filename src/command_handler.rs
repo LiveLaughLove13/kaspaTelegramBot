@@ -1,3 +1,4 @@
+use crate::ai::AiService;
 use crate::config::WalletMode;
 use crate::kaspa_client::KaspaClient;
 use crate::processor::NotificationProcessor;
@@ -20,6 +21,7 @@ pub struct CommandHandler {
     rate_limits: Arc<Mutex<HashMap<i64, Vec<Instant>>>>,
     // Multi-step /send flow state per user
     send_flows: Arc<Mutex<HashMap<i64, SendFlowState>>>,
+    ai_service: Arc<AiService>,
 }
 
 #[derive(Debug, Clone)]
@@ -34,10 +36,18 @@ enum SendFlowState {
 }
 
 impl CommandHandler {
+    fn escape_html(value: &str) -> String {
+        value
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+    }
+
     pub fn new(
         kaspa_client: Arc<KaspaClient>,
         telegram_client: Arc<TelegramClient>,
         transaction_sender: Arc<TransactionSender>,
+        ai_service: Arc<AiService>,
     ) -> Self {
         Self {
             kaspa_client,
@@ -46,6 +56,7 @@ impl CommandHandler {
             processor: None,
             rate_limits: Arc::new(Mutex::new(HashMap::new())),
             send_flows: Arc::new(Mutex::new(HashMap::new())),
+            ai_service,
         }
     }
 
@@ -167,6 +178,15 @@ impl CommandHandler {
                 "/wallet" => {
                     self.handle_wallet(chat_id, &parts).await?;
                 }
+                "/ai" => {
+                    self.handle_ai(chat_id, text).await?;
+                }
+                "/aipaid" => {
+                    self.handle_ai_paid(chat_id, &parts).await?;
+                }
+                "/aipay" => {
+                    self.handle_ai_pay(chat_id).await?;
+                }
                 _ => {
                     self.send_message(
                         chat_id,
@@ -214,6 +234,10 @@ impl CommandHandler {
 • <code>/wallet balance</code> - Show balance for your imported wallet
 • <code>/wallet importpk &lt;hex&gt;</code> - Import your private key for this bot session
 • <code>/wallet clear</code> - Remove your session wallet credential
+• <code>/ai &lt;prompt&gt;</code> - Ask Kaspa AI (question or statement; payment required)
+• <code>/ai status</code> - Show AI runtime and knowledge sync status
+• <code>/aipaid &lt;txid&gt;</code> - Submit payment TXID and receive AI answer
+• <code>/aipay</code> - Pay from connected wallet and auto-receive AI answer
 • <code>/mining</code> - Show mining pool connection details
 • <code>/help</code> - Show this help message
 
@@ -229,6 +253,260 @@ or simply:
 <code>/send</code> then follow prompts
 "#;
         self.send_message(chat_id, help_text).await
+    }
+
+    async fn handle_ai(&self, chat_id: i64, raw_text: &str) -> Result<()> {
+        if !self.ai_service.enabled() {
+            self.send_message(
+                chat_id,
+                "ℹ️ AI service is currently disabled by bot config.",
+            )
+            .await?;
+            return Ok(());
+        }
+
+        let question = raw_text.trim_start_matches("/ai").trim();
+        if question.eq_ignore_ascii_case("status") {
+            let report = self.ai_service.status_report().await;
+            self.send_message(chat_id, &report).await?;
+            return Ok(());
+        }
+
+        if question.is_empty() {
+            self.send_message(
+                chat_id,
+                "❌ <b>AI Prompt Missing</b>\n\n\
+                <b>Usage:</b> <code>/ai &lt;your kaspa prompt&gt;</code>\n\n\
+                <b>Example:</b>\n\
+                <code>/ai explain ghostdag in kaspa</code>",
+            )
+            .await?;
+            return Ok(());
+        }
+
+        let payment_request = self.ai_service.begin_question(chat_id, question).await?;
+        let response = format!(
+            "🤖 <b>Kaspa AI Request Started</b>\n\n\
+            Your prompt is saved.\n\n\
+            <b>Step 1:</b> Send at least <b>{:.8} KAS</b> to:\n\
+            <code>{}</code>\n\n\
+            <b>Step 2:</b> After sending, reply with:\n\
+            <code>/aipaid &lt;txid&gt;</code>\n\n\
+            <b>Or</b> if your wallet is already connected in this bot, simply run:\n\
+            <code>/aipay</code>\n\n\
+            <b>Example:</b>\n\
+            <code>/aipaid 1a2b3c...</code>\n\n\
+            If the payment is still propagating, wait a few seconds and try again.",
+            payment_request.minimum_payment_kas, payment_request.payment_address
+        );
+        self.send_message(chat_id, &response).await?;
+        Ok(())
+    }
+
+    async fn handle_ai_paid(&self, chat_id: i64, parts: &[&str]) -> Result<()> {
+        if !self.ai_service.enabled() {
+            self.send_message(
+                chat_id,
+                "ℹ️ AI service is currently disabled by bot config.",
+            )
+            .await?;
+            return Ok(());
+        }
+
+        if parts.len() < 2 {
+            self.send_message(
+                chat_id,
+                "❌ <b>Payment TXID Missing</b>\n\n\
+                <b>Usage:</b> <code>/aipaid &lt;txid&gt;</code>\n\n\
+                <b>Example:</b>\n\
+                <code>/aipaid 1a2b3c...</code>",
+            )
+            .await?;
+            return Ok(());
+        }
+
+        let txid = parts[1];
+        self.send_message(
+            chat_id,
+            "⏳ Verifying your payment...\nI will send your AI answer right after verification.",
+        )
+        .await?;
+
+        match self
+            .ai_service
+            .verify_payment_and_answer(chat_id, txid, self.kaspa_client.as_ref())
+            .await
+        {
+            Ok(Some(answer)) => {
+                let safe_answer = Self::escape_html(&answer);
+                self.send_message(
+                    chat_id,
+                    &format!(
+                        "✅ <b>Payment Verified</b>\n\n🧠 <b>Kaspa AI Answer</b>\n\n{}",
+                        safe_answer
+                    ),
+                )
+                .await?;
+            }
+            Ok(None) => {
+                self.send_message(
+                    chat_id,
+                    "ℹ️ No pending AI prompt found. Start one first with <code>/ai &lt;prompt&gt;</code>.",
+                )
+                .await?;
+            }
+            Err(e) => {
+                self.send_message(
+                    chat_id,
+                    &format!(
+                        "❌ <b>Payment Verification Failed</b>\n\n{}\n\n\
+                        Please check the TXID and amount, then retry <code>/aipaid &lt;txid&gt;</code>.",
+                        Self::escape_html(&e.to_string())
+                    ),
+                )
+                .await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn handle_ai_pay(&self, chat_id: i64) -> Result<()> {
+        if !self.ai_service.enabled() {
+            self.send_message(
+                chat_id,
+                "ℹ️ AI service is currently disabled by bot config.",
+            )
+            .await?;
+            return Ok(());
+        }
+        if !self.ai_service.has_pending_question(chat_id).await {
+            self.send_message(
+                chat_id,
+                "ℹ️ No pending AI prompt found.\n\nStart with <code>/ai &lt;prompt&gt;</code> first.",
+            )
+            .await?;
+            return Ok(());
+        }
+        if !self.transaction_sender.is_enabled().await {
+            self.send_message(
+                chat_id,
+                "🔒 In-chat AI payment is currently unavailable because send mode is disabled.",
+            )
+            .await?;
+            return Ok(());
+        }
+        if !self.transaction_sender.has_user_private_key(chat_id).await {
+            self.send_message(
+                chat_id,
+                "🔑 No wallet credential loaded.\n\nUse <code>/wallet importpk &lt;64-hex-private-key&gt;</code> first, then run <code>/aipay</code>.",
+            )
+            .await?;
+            return Ok(());
+        }
+
+        let from_address = match self
+            .transaction_sender
+            .get_user_wallet_address(chat_id)
+            .await
+        {
+            Ok(addr) => addr,
+            Err(e) => {
+                self.send_message(
+                    chat_id,
+                    &format!(
+                        "❌ Unable to resolve your wallet address for payment: {}",
+                        Self::escape_html(&e.to_string())
+                    ),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+
+        let payment = self.ai_service.payment_request();
+        let amount_sompi = parse_kas_to_sompi(&format!("{:.8}", payment.minimum_payment_kas))
+            .context("Invalid AI minimum payment amount in configuration")?;
+
+        self.send_message(
+            chat_id,
+            "🛰️ Sending AI payment from your connected wallet and verifying...",
+        )
+        .await?;
+
+        let send_result = self
+            .transaction_sender
+            .send_kaspa(SendKaspaRequest {
+                chat_id,
+                from_address,
+                to_address: payment.payment_address.clone(),
+                amount_sompi,
+            })
+            .await;
+
+        let sent = match send_result {
+            Ok(v) => v,
+            Err(e) => {
+                self.send_message(
+                    chat_id,
+                    &format!(
+                        "❌ Could not send AI payment from your wallet: {}",
+                        Self::escape_html(&e.to_string())
+                    ),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+
+        // Allow brief propagation window before verification.
+        let mut answer: Option<String> = None;
+        for _ in 0..5 {
+            match self
+                .ai_service
+                .verify_payment_and_answer(chat_id, &sent.txid, self.kaspa_client.as_ref())
+                .await
+            {
+                Ok(Some(v)) => {
+                    answer = Some(v);
+                    break;
+                }
+                Ok(None) => {
+                    break;
+                }
+                Err(_) => {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+            }
+        }
+
+        if let Some(answer) = answer {
+            let safe_answer = Self::escape_html(&answer);
+            self.send_message(
+                chat_id,
+                &format!(
+                    "✅ <b>AI Payment Sent & Verified</b>\n\
+                    <b>TXID:</b> <a href=\"https://kaspa.stream/transactions/{}\">{}</a>\n\n\
+                    🧠 <b>Kaspa AI Answer</b>\n\n{}",
+                    sent.txid, sent.txid, safe_answer
+                ),
+            )
+            .await?;
+        } else {
+            self.send_message(
+                chat_id,
+                &format!(
+                    "✅ <b>AI Payment Broadcasted</b>\n\
+                    <b>TXID:</b> <a href=\"https://kaspa.stream/transactions/{}\">{}</a>\n\n\
+                    Verification is still propagating. If answer does not arrive yet, run:\n\
+                    <code>/aipaid {}</code>",
+                    sent.txid, sent.txid, sent.txid
+                ),
+            )
+            .await?;
+        }
+
+        Ok(())
     }
 
     async fn handle_wallet(&self, chat_id: i64, parts: &[&str]) -> Result<()> {

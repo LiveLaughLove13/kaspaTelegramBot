@@ -34,6 +34,9 @@ impl TelegramClient {
             {"command": "refresh", "description": "Refresh balances from blockchain"},
             {"command": "send", "description": "Send KAS from your tracked wallet"},
             {"command": "wallet", "description": "Manage your wallet credential session"},
+            {"command": "ai", "description": "Ask Kaspa AI (payment required)"},
+            {"command": "aipaid", "description": "Submit payment txid for AI answer"},
+            {"command": "aipay", "description": "Pay from connected wallet for AI answer"},
             {"command": "cancel", "description": "Cancel active send flow"},
             {"command": "mining", "description": "Show mining pool connection details"}
         ]);

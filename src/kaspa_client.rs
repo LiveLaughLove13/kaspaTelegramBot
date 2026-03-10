@@ -569,6 +569,50 @@ impl KaspaClient {
         Ok(None)
     }
 
+    pub async fn get_output_amount_to_address(
+        &self,
+        txid: &str,
+        target_address: &str,
+    ) -> Result<Option<u64>> {
+        if let Ok(Some(mempool_entry)) = self.get_mempool_entry(txid).await {
+            let amount = mempool_entry
+                .transaction
+                .outputs
+                .iter()
+                .filter_map(|o| {
+                    o.verbose_data
+                        .as_ref()
+                        .map(|v| (v.script_public_key_address.to_string(), o.value))
+                })
+                .filter(|(addr, _)| addr == target_address)
+                .map(|(_, value)| value)
+                .sum::<u64>();
+            if amount > 0 {
+                return Ok(Some(amount));
+            }
+        }
+
+        let cache = self.recent_transactions.lock().await;
+        if let Some(tx) = cache.get(txid) {
+            let amount = tx
+                .outputs
+                .iter()
+                .filter_map(|o| {
+                    o.verbose_data
+                        .as_ref()
+                        .map(|v| (v.script_public_key_address.to_string(), o.value))
+                })
+                .filter(|(addr, _)| addr == target_address)
+                .map(|(_, value)| value)
+                .sum::<u64>();
+            if amount > 0 {
+                return Ok(Some(amount));
+            }
+        }
+
+        Ok(None)
+    }
+
     // Calculate amounts from transaction outputs
     // Returns: (sent_amount, received_amount) where:
     // - sent_amount: sum of outputs NOT to the tracked address

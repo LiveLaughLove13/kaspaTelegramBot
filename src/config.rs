@@ -11,6 +11,8 @@ pub struct Config {
     pub confirmation: ConfirmationConfig,
     #[serde(default)]
     pub wallet: WalletConfig,
+    #[serde(default)]
+    pub ai: AiConfig,
     // Wallet addresses to track (optional, can also be set via environment variable)
     #[serde(default)]
     pub wallet_addresses: Vec<String>,
@@ -94,6 +96,152 @@ pub struct WalletConfig {
     pub signer: WalletSignerConfig,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AiConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_ai_payment_address")]
+    pub payment_address: String,
+    #[serde(default = "default_ai_minimum_payment_kas")]
+    pub minimum_payment_kas: f64,
+    #[serde(default)]
+    pub local_model: LocalModelConfig,
+    #[serde(default)]
+    pub knowledge: AiKnowledgeConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalModelConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_local_model_endpoint")]
+    pub endpoint: String,
+    #[serde(default = "default_local_model_name")]
+    pub model: String,
+    #[serde(default = "default_local_model_timeout_seconds")]
+    pub timeout_seconds: u64,
+}
+
+/// Single repository entry for multi-repo knowledge base
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KnowledgeRepoEntry {
+    pub url: String,
+    /// Subdirectory name under base_path (e.g. "rusty-kaspa")
+    pub path: String,
+    #[serde(default = "default_branch")]
+    pub branch: String,
+}
+
+fn default_branch() -> String {
+    "master".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AiKnowledgeConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Base directory for all repos (e.g. "tools/knowledge")
+    #[serde(default = "default_ai_knowledge_base_path")]
+    pub base_path: String,
+    /// Multi-repo list. If non-empty, used instead of repo_url/local_path
+    #[serde(default)]
+    pub repos: Vec<KnowledgeRepoEntry>,
+    #[serde(default = "default_ai_knowledge_repo_url")]
+    pub repo_url: String,
+    #[serde(default = "default_ai_knowledge_local_path")]
+    pub local_path: String,
+    #[serde(default = "default_ai_knowledge_refresh_minutes")]
+    pub refresh_minutes: u64,
+    #[serde(default = "default_ai_knowledge_max_context_chars")]
+    pub max_context_chars: usize,
+    #[serde(default = "default_ai_knowledge_git_timeout_seconds")]
+    pub git_timeout_seconds: u64,
+}
+
+impl Default for AiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            payment_address: default_ai_payment_address(),
+            minimum_payment_kas: default_ai_minimum_payment_kas(),
+            local_model: LocalModelConfig::default(),
+            knowledge: AiKnowledgeConfig::default(),
+        }
+    }
+}
+
+impl Default for LocalModelConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            endpoint: default_local_model_endpoint(),
+            model: default_local_model_name(),
+            timeout_seconds: default_local_model_timeout_seconds(),
+        }
+    }
+}
+
+fn default_ai_knowledge_base_path() -> String {
+    "tools/knowledge".to_string()
+}
+
+impl Default for AiKnowledgeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            base_path: default_ai_knowledge_base_path(),
+            repos: Vec::new(),
+            repo_url: default_ai_knowledge_repo_url(),
+            local_path: default_ai_knowledge_local_path(),
+            refresh_minutes: default_ai_knowledge_refresh_minutes(),
+            max_context_chars: default_ai_knowledge_max_context_chars(),
+            git_timeout_seconds: default_ai_knowledge_git_timeout_seconds(),
+        }
+    }
+}
+
+/// Resolved repo: (url, full_local_path, branch, github_base_url for source links)
+pub type ResolvedKnowledgeRepo = (String, std::path::PathBuf, String, String);
+
+impl AiKnowledgeConfig {
+    /// Returns list of repos to sync. Uses repos if non-empty, else legacy single repo.
+    pub fn resolved_repos(&self) -> Vec<ResolvedKnowledgeRepo> {
+        if self.repos.is_empty() {
+            let cwd = std::env::current_dir().unwrap_or_default();
+            let path = if self.local_path.starts_with('/') || (cfg!(windows) && self.local_path.len() > 1 && self.local_path.chars().nth(1) == Some(':')) {
+                std::path::PathBuf::from(&self.local_path)
+            } else {
+                cwd.join(&self.local_path)
+            };
+            let github_base = repo_url_to_github_base(&self.repo_url);
+            return vec![(
+                self.repo_url.clone(),
+                path,
+                "master".to_string(),
+                github_base,
+            )];
+        }
+        let cwd = std::env::current_dir().unwrap_or_default();
+        let base = if self.base_path.starts_with('/') || (cfg!(windows) && self.base_path.len() > 1 && self.base_path.chars().nth(1) == Some(':')) {
+            std::path::PathBuf::from(&self.base_path)
+        } else {
+            cwd.join(&self.base_path)
+        };
+        self.repos
+            .iter()
+            .map(|r| {
+                let full_path = base.join(&r.path);
+                let github_base = repo_url_to_github_base(&r.url);
+                (r.url.clone(), full_path, r.branch.clone(), github_base)
+            })
+            .collect()
+    }
+}
+
+fn repo_url_to_github_base(url: &str) -> String {
+    url.trim_end_matches(".git").trim_end_matches('/').to_string()
+}
+
 impl Default for WalletConfig {
     fn default() -> Self {
         Self {
@@ -113,6 +261,46 @@ fn default_true() -> bool {
 
 fn default_confirmation_depth() -> u64 {
     3 // Optimized for 10 BPS network (3 DAA = 0.3 seconds)
+}
+
+fn default_ai_payment_address() -> String {
+    "kaspa:qp44zy8snd2rf6zw5eenv0jxkn3h6ppv0mfsrp5l3kpjdqlsylknj5exp24mz".to_string()
+}
+
+fn default_ai_minimum_payment_kas() -> f64 {
+    0.1
+}
+
+fn default_local_model_endpoint() -> String {
+    "http://127.0.0.1:11434/api/generate".to_string()
+}
+
+fn default_local_model_name() -> String {
+    "qwen2.5-coder:7b".to_string()
+}
+
+fn default_local_model_timeout_seconds() -> u64 {
+    45
+}
+
+fn default_ai_knowledge_repo_url() -> String {
+    "https://github.com/kaspanet/rusty-kaspa.git".to_string()
+}
+
+fn default_ai_knowledge_local_path() -> String {
+    "tools/knowledge/rusty-kaspa".to_string()
+}
+
+fn default_ai_knowledge_refresh_minutes() -> u64 {
+    30
+}
+
+fn default_ai_knowledge_max_context_chars() -> usize {
+    8000
+}
+
+fn default_ai_knowledge_git_timeout_seconds() -> u64 {
+    20
 }
 
 impl Config {
@@ -189,6 +377,28 @@ preconfigured_chat_private_keys = {}
 [wallet.signer]
 url = ""
 api_key = ""
+
+# AI Q&A settings (payment-gated)
+[ai]
+enabled = false
+# User must pay at least this amount to ask one AI question
+minimum_payment_kas = 0.1
+# Payment destination address
+payment_address = "kaspa:qp44zy8snd2rf6zw5eenv0jxkn3h6ppv0mfsrp5l3kpjdqlsylknj5exp24mz"
+
+[ai.local_model]
+enabled = true
+endpoint = "http://127.0.0.1:11434/api/generate"
+model = "qwen2.5-coder:7b"
+timeout_seconds = 45
+
+[ai.knowledge]
+enabled = true
+repo_url = "https://github.com/kaspanet/rusty-kaspa.git"
+local_path = "tools/knowledge/rusty-kaspa"
+refresh_minutes = 30
+max_context_chars = 8000
+git_timeout_seconds = 20
 "#;
             fs::write(config_path, default_toml)?;
             anyhow::bail!(
