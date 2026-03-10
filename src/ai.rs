@@ -1217,9 +1217,7 @@ fn score_hit(file: &str, matched: &str, tokens: &[String]) -> i64 {
     score
 }
 
-fn build_multi_knowledge_index(
-    inputs: &[(PathBuf, String, String)],
-) -> Result<KnowledgeIndex> {
+fn build_multi_knowledge_index(inputs: &[(PathBuf, String, String)]) -> Result<KnowledgeIndex> {
     let mut chunks = Vec::new();
     for (repo_path, head, github_base) in inputs {
         let mut files = Vec::new();
@@ -1254,10 +1252,8 @@ fn build_multi_knowledge_index(
                     }
                     let line_start = start + 1;
                     let label = format!("{}:{}-{}", rel, line_start, end);
-                    let source_url = format!(
-                        "{}/blob/{}/{}#L{}",
-                        github_base, head, rel, line_start
-                    );
+                    let source_url =
+                        format!("{}/blob/{}/{}#L{}", github_base, head, rel, line_start);
                     let len = tf.values().sum::<usize>();
                     chunks.push(KnowledgeChunk {
                         label,

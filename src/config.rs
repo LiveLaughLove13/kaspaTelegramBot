@@ -208,7 +208,11 @@ impl AiKnowledgeConfig {
     pub fn resolved_repos(&self) -> Vec<ResolvedKnowledgeRepo> {
         if self.repos.is_empty() {
             let cwd = std::env::current_dir().unwrap_or_default();
-            let path = if self.local_path.starts_with('/') || (cfg!(windows) && self.local_path.len() > 1 && self.local_path.chars().nth(1) == Some(':')) {
+            let path = if self.local_path.starts_with('/')
+                || (cfg!(windows)
+                    && self.local_path.len() > 1
+                    && self.local_path.chars().nth(1) == Some(':'))
+            {
                 std::path::PathBuf::from(&self.local_path)
             } else {
                 cwd.join(&self.local_path)
@@ -222,7 +226,11 @@ impl AiKnowledgeConfig {
             )];
         }
         let cwd = std::env::current_dir().unwrap_or_default();
-        let base = if self.base_path.starts_with('/') || (cfg!(windows) && self.base_path.len() > 1 && self.base_path.chars().nth(1) == Some(':')) {
+        let base = if self.base_path.starts_with('/')
+            || (cfg!(windows)
+                && self.base_path.len() > 1
+                && self.base_path.chars().nth(1) == Some(':'))
+        {
             std::path::PathBuf::from(&self.base_path)
         } else {
             cwd.join(&self.base_path)
@@ -239,7 +247,9 @@ impl AiKnowledgeConfig {
 }
 
 fn repo_url_to_github_base(url: &str) -> String {
-    url.trim_end_matches(".git").trim_end_matches('/').to_string()
+    url.trim_end_matches(".git")
+        .trim_end_matches('/')
+        .to_string()
 }
 
 impl Default for WalletConfig {
